@@ -129,12 +129,36 @@ Atlas que ya tenés. Si no hay `MONGODB_URI`, usa RAM como antes.
 
 ---
 
-## 4. Límites y próximos pasos
+## 4. Predicción fisiológica (v5.2 — Fase 1 del modelo predictivo)
+
+Se agregó un **modelo fisiológico** que proyecta a dónde va la glucosa a **30 y
+60 min** combinando tres efectos: la **insulina activa (IOB)** que sigue bajando
+la glucosa, los **carbos activos (COB)** que la suben, y el **momento** de la
+tendencia reciente. Como no hay loop/bomba, el bot **calcula el IOB/COB por su
+cuenta** (curva exponencial de la Apidra con DIA 4 h y pico ~65 min; absorción
+de carbos ~180 min) desde los tratamientos de Nightscout.
+
+- Nuevo comando **`/prediccion`**: valor estimado a 30/60 min con banda de
+  incertidumbre + nivel de riesgo de hipoglucemia + IOB/COB.
+- Las **alertas predictivas** ahora usan este modelo (antes era una recta): avisa
+  una hipoglucemia en camino aunque la tendencia esté plana, si hay insulina
+  activa suficiente.
+- El **cerebro** ve la predicción en su contexto, así responde con más criterio.
+
+**Parámetros clínicos** (variables de entorno, con default = perfil de Vittore;
+**deben coincidir con el endocrinólogo**): `ISF=30`, `CARB_RATIO=10`,
+`INSULIN_DIA_MIN=240`, `INSULIN_PEAK_MIN=65`, `CARB_ABSORB_MIN=180`.
+
+Es **Fase 1**: funciona desde el día 1 y no necesita datos. La **Fase 2** (modelo
+de ML que se reentrena de noche y aprende de la historia) está descrita en el
+documento `Modelo_Predictivo_Glucosa_Diseno.md`.
+
+## 5. Límites y próximos pasos
 
 - Los umbrales de alerta y todo lo relativo a insulina **deben revisarse con el
   endocrinólogo** antes de confiar en el sistema.
-- Las estimaciones (carbs por foto, IOB, predicción) son aproximadas.
-- La proyección de glucosa es lineal por tendencia reciente: útil para
-  anticipar, no es una certeza.
-- Pendiente (no incluido acá): capa de llamada telefónica real (Twilio) para
+- Las estimaciones (carbs por foto, IOB/COB, predicción) son aproximadas; la
+  predicción a 60 min es orientativa (comidas y ejercicio la complican).
+- El modelo **no calcula dosis**: solo anticipa y alerta.
+- Pendiente: Fase 2 (ML que aprende), capa de llamada real (Twilio) para
   emergencias, e integración de actividad del Garmin.

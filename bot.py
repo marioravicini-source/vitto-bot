@@ -28,6 +28,7 @@ endocrinólogo.
 import os
 import io
 import json
+import math
 import base64
 import asyncio
 import logging
@@ -93,6 +94,16 @@ BG_HIGH = int(os.environ.get("BG_HIGH", "180"))
 BG_LOW = int(os.environ.get("BG_LOW", "70"))
 BG_URGENT_HIGH = int(os.environ.get("BG_URGENT_HIGH", "250"))
 BG_URGENT_LOW = int(os.environ.get("BG_URGENT_LOW", "55"))
+
+# ─── Parámetros clínicos (perfil de Vittore) para la predicción ──
+# ⚠ Deben coincidir con lo que indica el endocrinólogo. Solo se usan para
+# PREDECIR y ALERTAR, nunca para calcular dosis.
+ISF = float(os.environ.get("ISF", "30"))            # sensibilidad: mg/dL por unidad
+CARB_RATIO = float(os.environ.get("CARB_RATIO", "10"))   # ratio: gramos por unidad (1U:10g)
+INSULIN_DIA_MIN = int(os.environ.get("INSULIN_DIA_MIN", "240"))   # duración insulina activa (Apidra 4h)
+INSULIN_PEAK_MIN = int(os.environ.get("INSULIN_PEAK_MIN", "65"))  # pico de acción de la Apidra
+CARB_ABSORB_MIN = int(os.environ.get("CARB_ABSORB_MIN", "180"))   # tiempo de absorción de carbos
+CSF = ISF / CARB_RATIO if CARB_RATIO else 0.0        # sensibilidad a carbos: mg/dL por gramo
 
 # Ventana de predicción (minutos) para el aviso preventivo de baja
 PREDICT_MIN = int(os.environ.get("PREDICT_MIN", "20"))
@@ -569,6 +580,176 @@ def format_patterns_digest(p: dict, compact: bool = False) -> str:
     return "\n".join(lines)
 
 
+# ─── Predicción fisiológica (Fase 1): IOB/COB + proyección 30/60 ─
+# Modelo transparente que NO calcula dosis: proyecta a dónde va la glucosa
+# combinando la insulina que sigue actuando (baja) + los carbos que se están
+# absorbiendo (suben) + el momento de la tendencia reciente del sensor.
+
+def insulin_remaining_fraction(age_min: float,
+                               dia: int = INSULIN_DIA_MIN,
+                               peak: int = INSULIN_PEAK_MIN) -> float:
+    """Fracción de un bolo que sigue activa `age_min` después (modelo exponencial oref/Loop)."""
+    if age_min <= 0:
+        return 1.0
+    if age_min >= dia:
+        return 0.0
+    td, tp = float(dia), float(peak)
+    tau = tp * (1 - tp / td) / (1 - 2 * tp / td)
+    a = 2 * tau / td
+    s = 1 / (1 - a + (1 + a) * math.exp(-td / tau))
+    t = age_min
+    iob = 1 - s * (1 - a) * (((t * t) / (tau * td * (1 - a)) - t / tau - 1) * math.exp(-t / tau) + 1)
+    return max(0.0, min(1.0, iob))
+
+
+def carb_remaining_fraction(age_min: float, tabs: int = CARB_ABSORB_MIN) -> float:
+    """Fracción de una comida que todavía no se absorbió (absorción lineal)."""
+    if age_min <= 0:
+        return 1.0
+    if age_min >= tabs:
+        return 0.0
+    return 1 - age_min / tabs
+
+
+def compute_iob(boluses: list, at_offset: float = 0) -> float:
+    """Insulina activa (U). boluses: lista de (edad_min, unidades)."""
+    return sum(u * insulin_remaining_fraction(age + at_offset) for age, u in boluses)
+
+
+def compute_cob(carbs: list, at_offset: float = 0) -> float:
+    """Carbos activos (g). carbs: lista de (edad_min, gramos)."""
+    return sum(g * carb_remaining_fraction(age + at_offset) for age, g in carbs)
+
+
+def insulin_effect(boluses: list, horizon: int) -> float:
+    """Cambio de glucosa por insulina que actúa en [ahora, ahora+horizon] (negativo)."""
+    acted = sum(u * (insulin_remaining_fraction(age) - insulin_remaining_fraction(age + horizon))
+                for age, u in boluses)
+    return -ISF * acted
+
+
+def carb_effect(carbs: list, horizon: int) -> float:
+    """Cambio de glucosa por carbos absorbidos en la ventana (positivo)."""
+    absorbed = sum(g * (carb_remaining_fraction(age) - carb_remaining_fraction(age + horizon))
+                   for age, g in carbs)
+    return CSF * absorbed
+
+
+def momentum_effect(slope: Optional[float], horizon: int, tau_m: float = 20.0) -> float:
+    """Aporte de la tendencia reciente, decae para no dominar a 60 min."""
+    if slope is None:
+        return 0.0
+    return slope * tau_m * (1 - math.exp(-horizon / tau_m))
+
+
+def predict_physio(current: int, slope: Optional[float], boluses: list, carbs: list,
+                   horizon: int) -> int:
+    delta = insulin_effect(boluses, horizon) + carb_effect(carbs, horizon) + momentum_effect(slope, horizon)
+    return int(max(20, min(500, round(current + delta))))
+
+
+def prediction_band(horizon: int, exercise_recent: bool, carbs_active: bool) -> int:
+    """Banda de incertidumbre (mg/dL), crece con el horizonte y con ejercicio/comida."""
+    band = 8 + 0.30 * horizon
+    if exercise_recent:
+        band *= 1.6
+    if carbs_active:
+        band *= 1.2
+    return int(round(band))
+
+
+def parse_active_treatments(treatments: list, now_utc: datetime) -> tuple[list, list, bool]:
+    """Extrae bolos e insulina/carbos activos y si hubo ejercicio reciente."""
+    boluses, carbs = [], []
+    exercise_recent = False
+    for t in treatments:
+        created = t.get("created_at", "")
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        age = (now_utc - dt).total_seconds() / 60
+        if age < 0:
+            continue
+        notes = (t.get("notes", "") or "").lower()
+        ins = t.get("insulin")
+        # Excluir la basal (Glargina): perfil plano, se sigue aparte.
+        if ins and age < INSULIN_DIA_MIN and "basal" not in notes and "glargina" not in notes:
+            try:
+                boluses.append((age, float(ins)))
+            except (TypeError, ValueError):
+                pass
+        cb = t.get("carbs")
+        if cb and age < CARB_ABSORB_MIN:
+            try:
+                carbs.append((age, float(cb)))
+            except (TypeError, ValueError):
+                pass
+        if t.get("eventType") == "Exercise" and age < 360:  # efecto hasta varias horas después
+            exercise_recent = True
+    return boluses, carbs, exercise_recent
+
+
+def assess_hypo_risk(current: int, slope: Optional[float], boluses: list, carbs: list,
+                     exercise_recent: bool) -> dict:
+    """Nivel de riesgo de hipoglucemia (rule-based, no probabilidad calibrada)."""
+    p30 = predict_physio(current, slope, boluses, carbs, 30)
+    p60 = predict_physio(current, slope, boluses, carbs, 60)
+    b30 = prediction_band(30, exercise_recent, bool(carbs))
+    b60 = prediction_band(60, exercise_recent, bool(carbs))
+    low30, low60 = p30 - b30, p60 - b60
+
+    level = "ninguno"
+    if current <= BG_URGENT_LOW or p30 <= BG_URGENT_LOW:
+        level = "alto"
+    elif p30 <= BG_LOW or low30 <= BG_LOW or current <= BG_LOW:
+        level = "alto"
+    elif p60 <= BG_LOW or low60 <= BG_LOW:
+        level = "medio"
+    elif exercise_recent and p60 <= BG_LOW + 20:
+        level = "medio"
+    return {"level": level, "p30": p30, "p60": p60, "b30": b30, "b60": b60}
+
+
+async def compute_prediction() -> Optional[dict]:
+    """Junta datos de Nightscout y devuelve la predicción completa."""
+    entry = await get_current_bg()
+    if not entry:
+        return None
+    entries, treatments = await asyncio.gather(get_recent_entries(1), get_treatments(6))
+    current = entry.get("sgv", 0)
+    slope = bg_slope(entries)
+    boluses, carbs, ex = parse_active_treatments(treatments, datetime.now(timezone.utc))
+    risk = assess_hypo_risk(current, slope, boluses, carbs, ex)
+    return {
+        "current": current, "slope": slope,
+        "p30": risk["p30"], "b30": risk["b30"],
+        "p60": risk["p60"], "b60": risk["b60"],
+        "risk": risk["level"],
+        "iob": compute_iob(boluses), "cob": compute_cob(carbs),
+        "exercise_recent": ex,
+    }
+
+
+def format_prediction(pred: dict) -> str:
+    """Texto compacto de la predicción para Telegram / contexto."""
+    trend = f"{pred['slope'] * 60:+.0f}/h" if pred.get("slope") is not None else "s/d"
+    risk_emoji = {"alto": "🔴", "medio": "🟡", "ninguno": "🟢"}.get(pred["risk"], "🟢")
+    risk_txt = {"alto": "riesgo ALTO de hipo", "medio": "riesgo medio de hipo",
+                "ninguno": "sin riesgo de hipo a la vista"}.get(pred["risk"])
+    lines = [
+        f"🔮 Predicción (tendencia {trend})",
+        f"  +30 min: ~{pred['p30']} mg/dL (±{pred['b30']})",
+        f"  +60 min: ~{pred['p60']} mg/dL (±{pred['b60']})",
+        f"{risk_emoji} {risk_txt}",
+        f"💉 IOB {pred['iob']:.1f}U · 🍞 COB {pred['cob']:.0f}g",
+    ]
+    if pred.get("exercise_recent"):
+        lines.append("🏒 Ejercicio reciente: mayor incertidumbre y ojo con las bajas.")
+    lines.append("ℹ️ Es una estimación, no un dato exacto.")
+    return "\n".join(lines)
+
+
 # ─── Cerebro: Claude (chat con herramientas + visión) ────────────
 SYSTEM_PROMPT = f"""Sos VittoBot, el asistente de diabetes tipo 1 de Vittore, un adolescente de 15 años, deportista (hockey sobre patín y gimnasio). Le hablás a él y a veces a su papá (Mario).
 
@@ -728,27 +909,27 @@ async def _run_tool(chat_id: int, name: str, args: dict) -> tuple[str, Optional[
 
 async def build_full_context(chat_id: int) -> str:
     """Arma el contexto que ve Claude en cada mensaje."""
-    entry, entries3 = await asyncio.gather(get_current_bg(), get_recent_entries(3))
-    treatments, device_status = await asyncio.gather(get_treatments(6), get_device_status())
+    entry, entries3, treatments = await asyncio.gather(
+        get_current_bg(), get_recent_entries(3), get_treatments(6))
 
     parts = []
     if entry:
-        slope = bg_slope(entries3)
-        pred = predict_bg(entry.get("sgv", 0), slope, PREDICT_MIN)
-        bg = format_bg_message(entry)
-        if pred is not None:
-            bg += f"\nProyección ~{PREDICT_MIN}min: ~{pred} mg/dL (tendencia {slope*60:+.0f}/h)"
-        parts.append("[GLUCOSA ACTUAL]\n" + bg)
-    parts.append("[ÚLTIMAS 3H]\n" + summarize_entries(entries3))
+        parts.append("[GLUCOSA ACTUAL]\n" + format_bg_message(entry))
 
-    iob, cob = extract_iob_cob(device_status)
-    if iob is not None or cob is not None:
-        s = []
-        if iob is not None:
-            s.append(f"IOB (insulina activa): {iob:.1f}U")
-        if cob is not None:
-            s.append(f"COB (carbs activos): {cob:.0f}g")
-        parts.append("[INSULINA/CARBS ACTIVOS]\n" + " · ".join(s))
+    # Predicción fisiológica (Fase 1): IOB/COB propios + proyección 30/60 + riesgo.
+    if entry:
+        slope = bg_slope(entries3)
+        boluses, carbs, ex = parse_active_treatments(treatments, datetime.now(timezone.utc))
+        risk = assess_hypo_risk(entry.get("sgv", 0), slope, boluses, carbs, ex)
+        pred = {
+            "current": entry.get("sgv", 0), "slope": slope,
+            "p30": risk["p30"], "b30": risk["b30"], "p60": risk["p60"], "b60": risk["b60"],
+            "risk": risk["level"], "iob": compute_iob(boluses), "cob": compute_cob(carbs),
+            "exercise_recent": ex,
+        }
+        parts.append("[PREDICCIÓN]\n" + format_prediction(pred))
+
+    parts.append("[ÚLTIMAS 3H]\n" + summarize_entries(entries3))
 
     if treatments:
         parts.append("[TRATAMIENTOS ÚLTIMAS 6H]\n" + format_treatments(treatments))
@@ -1000,6 +1181,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "¡Hola! Soy VittoBot, tu asistente de glucosa 🩺\n\n"
         "Podés:\n"
         "• /glucosa — lectura actual\n"
+        "• /prediccion — a dónde va tu glucosa (30/60 min)\n"
         "• /resumen — últimas 3 horas\n"
         "• /tratamientos — insulina y carbs (6h)\n"
         "• /registro — lo de hoy\n"
@@ -1024,6 +1206,18 @@ async def cmd_glucosa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
     else:
         await update.message.reply_text("No pude obtener datos de Nightscout.")
+
+
+async def cmd_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    await update.message.chat.send_action("typing")
+    pred = await compute_prediction()
+    if not pred:
+        await update.message.reply_text("No pude obtener datos de Nightscout para predecir.")
+        return
+    header = f"🩸 Ahora: {pred['current']} mg/dL — {bg_indicator(pred['current'])}\n"
+    await update.message.reply_text(header + format_prediction(pred))
 
 
 async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1209,19 +1403,15 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
         return
 
     level = classify_bg(sgv)
-    entries = await get_recent_entries(1)
+    entries, treatments = await asyncio.gather(get_recent_entries(1), get_treatments(6))
     slope = bg_slope(entries)
-    iob, _ = extract_iob_cob(await get_device_status())
+    boluses, carbs, ex = parse_active_treatments(treatments, now)
+    iob = compute_iob(boluses)
+    risk = assess_hypo_risk(sgv, slope, boluses, carbs, ex)
 
-    # 2) Aviso predictivo: en rango pero bajando hacia hipoglucemia
-    predicted = predict_bg(sgv, slope, PREDICT_MIN)
-    predictive = (
-        level == "in_range" and slope is not None and slope < -1.0
-        and predicted is not None and predicted <= BG_LOW
-    )
-
-    order = {"urgent_low": 0, "low": 1, "in_range": 2, "high": 3, "urgent_high": 4, "predicted_low": 1}
-    effective = "predicted_low" if predictive and level == "in_range" else level
+    # 2) Aviso predictivo (modelo fisiológico): en rango pero yendo hacia hipoglucemia
+    predictive = level == "in_range" and risk["level"] in ("alto", "medio")
+    effective = "predicted_low" if predictive else level
 
     # ¿Corresponde avisar?
     should = False
@@ -1245,18 +1435,23 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
             store.set_alert_state({"level": "in_range", "ts": now.isoformat()})
         return
 
-    msg = _build_alert_message(entry, effective, slope, iob)
+    msg = _build_alert_message(entry, effective, slope, iob, risk)
     _broadcast(context, msg)
     store.set_alert_state({"level": effective, "ts": now.isoformat()})
 
 
-def _build_alert_message(entry: dict, level: str, slope: Optional[float], iob: Optional[float]) -> str:
+def _build_alert_message(entry: dict, level: str, slope: Optional[float], iob: Optional[float],
+                         risk: Optional[dict] = None) -> str:
     base = format_bg_message(entry)
     iob_txt = f"\n💉 Insulina activa: {iob:.1f}U" if iob else ""
+    pred_txt = ""
+    if risk:
+        pred_txt = f"\n🔮 Proyección: ~{risk['p30']} en 30min · ~{risk['p60']} en 60min"
     if level == "urgent_low":
         return f"🚨 HIPOGLUCEMIA URGENTE 🚨\n{base}{iob_txt}\n¡Vittore necesita azúcar rápido AHORA! Medir de nuevo en 15 min."
     if level == "predicted_low":
-        return f"⚠️ Ojo: viene bajando y podría entrar en hipoglucemia pronto.\n{base}{iob_txt}\nConsiderá un colación/azúcar rápido y volvé a medir."
+        return (f"⚠️ Ojo: el modelo ve una hipoglucemia en camino.{pred_txt}\n{base}{iob_txt}\n"
+                "Considerá una colación/azúcar rápido y volvé a medir.")
     if level == "low":
         return f"🟡 Glucosa baja.\n{base}{iob_txt}\nConsiderá carbohidratos rápidos y medir en 15 min."
     if level == "urgent_high":
@@ -1296,6 +1491,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("glucosa", cmd_glucosa))
+    app.add_handler(CommandHandler("prediccion", cmd_prediccion))
     app.add_handler(CommandHandler("resumen", cmd_resumen))
     app.add_handler(CommandHandler("tratamientos", cmd_tratamientos))
     app.add_handler(CommandHandler("registro", cmd_registro))
