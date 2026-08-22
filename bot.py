@@ -69,10 +69,17 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NIGHTSCOUT_URL = os.environ["NIGHTSCOUT_URL"].rstrip("/")
 NIGHTSCOUT_API_SECRET = os.environ.get("NIGHTSCOUT_API_SECRET", "")
 
+# Proveedor del "cerebro": "groq" (gratis) o "anthropic" (Claude, de pago).
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # solo para audio (Whisper)
+# Groq (capa gratuita): chat con herramientas + visión + audio (Whisper).
+# gpt-oss-120b es la versión grande del que usábamos: razona mucho mejor y es gratis.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_CHAT_MODEL = os.environ.get("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 
 ALLOWED_USERS = [u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",") if u.strip()]
@@ -107,9 +114,29 @@ logger = logging.getLogger("VittoBot")
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API_KEY) else None
 groq_client = Groq(api_key=GROQ_API_KEY) if (Groq and GROQ_API_KEY) else None
 
-if not anthropic_client:
-    logger.warning("⚠ Sin ANTHROPIC_API_KEY: el chat inteligente está deshabilitado. "
-                   "Configurá ANTHROPIC_API_KEY en Railway.")
+
+def brain_provider() -> str:
+    """Qué proveedor se usa realmente, según config y claves disponibles."""
+    if LLM_PROVIDER == "anthropic" and anthropic_client:
+        return "anthropic"
+    if groq_client:
+        return "groq"
+    if anthropic_client:
+        return "anthropic"
+    return "none"
+
+
+def brain_label() -> str:
+    p = brain_provider()
+    if p == "anthropic":
+        return f"Claude ({ANTHROPIC_MODEL})"
+    if p == "groq":
+        return f"Groq ({GROQ_CHAT_MODEL})"
+    return "SIN cerebro (falta GROQ_API_KEY o ANTHROPIC_API_KEY)"
+
+
+if brain_provider() == "none":
+    logger.warning("⚠ Sin cerebro: configurá GROQ_API_KEY (gratis) o ANTHROPIC_API_KEY en Railway.")
 
 
 # ─── Persistencia (MongoDB opcional, con fallback en RAM) ────────
@@ -744,6 +771,29 @@ async def build_full_context(chat_id: int) -> str:
     return "\n\n".join(parts)
 
 
+def extract_answer(text: str) -> str:
+    """Descarta el bloque de razonamiento <think> de modelos como gpt-oss."""
+    if not text:
+        return ""
+    if "</think>" in text:
+        return text.split("</think>", 1)[1].strip()
+    if "<think>" in text:
+        return text.replace("<think>", "").strip()
+    return text.strip()
+
+
+def _openai_tools() -> list:
+    """Convierte TOOLS (formato Anthropic) al formato function-calling de Groq/OpenAI."""
+    return [{
+        "type": "function",
+        "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["input_schema"],
+        },
+    } for t in TOOLS]
+
+
 def _claude_call(messages: list, tools: Optional[list] = None, system: str = SYSTEM_PROMPT,
                  max_tokens: int = 900):
     """Llamada síncrona a Claude (se corre en thread)."""
@@ -753,30 +803,42 @@ def _claude_call(messages: list, tools: Optional[list] = None, system: str = SYS
     return anthropic_client.messages.create(**kwargs)
 
 
-async def ask_llm(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
-    """Chat con Claude usando herramientas. Devuelve (respuesta, acciones_registradas)."""
-    if not anthropic_client:
-        return ("El asistente inteligente no está configurado (falta ANTHROPIC_API_KEY). "
-                "Igual podés usar /glucosa, /resumen, /tratamientos y /patrones.", [])
+def _groq_call(messages: list, tools: Optional[list] = None, model: Optional[str] = None,
+               max_tokens: int = 900, temperature: float = 0.6):
+    """Llamada síncrona a Groq (chat.completions, se corre en thread)."""
+    kwargs = dict(model=model or GROQ_CHAT_MODEL, messages=messages,
+                  max_tokens=max_tokens, temperature=temperature)
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    return groq_client.chat.completions.create(**kwargs)
 
+
+async def ask_llm(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
+    """Chat con herramientas. Enruta al proveedor configurado (Groq gratis o Claude)."""
+    provider = brain_provider()
+    if provider == "anthropic":
+        return await _ask_anthropic(chat_id, user_message, ns_context)
+    if provider == "groq":
+        return await _ask_groq(chat_id, user_message, ns_context)
+    return ("El asistente inteligente no está configurado (falta GROQ_API_KEY o ANTHROPIC_API_KEY). "
+            "Igual podés usar /glucosa, /resumen, /tratamientos y /patrones.", [])
+
+
+async def _ask_anthropic(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
     history = store.get_history(chat_id, limit=20)
     messages = list(history)
     messages.append({"role": "user", "content": f"{ns_context}\n\n[MENSAJE DE VITTORE]\n{user_message}"})
-
     actions: list[dict] = []
     final_text = ""
     try:
-        for _ in range(4):  # hasta 4 vueltas de herramientas
+        for _ in range(4):
             resp = await asyncio.to_thread(_claude_call, messages, TOOLS)
-            # Acumular texto
             text_blocks = [b.text for b in resp.content if b.type == "text"]
             if text_blocks:
                 final_text = "\n".join(t for t in text_blocks if t).strip()
-
             if resp.stop_reason != "tool_use":
                 break
-
-            # Ejecutar herramientas y devolver resultados
             messages.append({"role": "assistant", "content": resp.content})
             tool_results = []
             for block in resp.content:
@@ -785,64 +847,121 @@ async def ask_llm(chat_id: int, user_message: str, ns_context: str) -> tuple[str
                     if action:
                         actions.append(action)
                     tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
+                        "type": "tool_result", "tool_use_id": block.id, "content": result,
                     })
             messages.append({"role": "user", "content": tool_results})
-
         if not final_text:
             final_text = "Listo. ✅" if actions else "No estoy seguro de qué necesitás. ¿Me lo repetís?"
-
         store.add_history(chat_id, "user", user_message)
         store.add_history(chat_id, "assistant", final_text)
         return final_text, actions
     except Exception as e:
-        logger.error(f"ask_llm: {type(e).__name__}: {e}")
+        logger.error(f"_ask_anthropic: {type(e).__name__}: {e}")
         return (f"Tuve un problema para pensar la respuesta ({type(e).__name__}). Probá de nuevo en un momento.", actions)
 
 
-# ─── Visión: foto de comida → carbohidratos (Claude) ─────────────
-async def analyze_food_image(image_bytes: bytes, caption: str = "") -> tuple[str, Optional[float]]:
-    """Devuelve (texto_para_usuario, carbs_estimados)."""
-    if not anthropic_client:
-        return ("No puedo analizar fotos sin ANTHROPIC_API_KEY configurada.", None)
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    prompt = (
-        "Analizá esta foto de comida para una persona con diabetes tipo 1. "
-        "Estimá los carbohidratos totales. Respondé SOLO un JSON válido con esta forma:\n"
-        '{"descripcion": "qué ves, breve", "carbs_g": <número>, "confianza": "alta|media|baja", '
-        '"comentario": "1 frase útil, aclarando que es estimación"}\n'
-        "Nunca sugieras dosis de insulina."
-    )
-    if caption:
-        prompt += f"\nComentario del usuario: {caption}"
+async def _ask_groq(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
+    history = store.get_history(chat_id, limit=20)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += list(history)
+    messages.append({"role": "user", "content": f"{ns_context}\n\n[MENSAJE DE VITTORE]\n{user_message}"})
+    actions: list[dict] = []
+    final_text = ""
+    tools = _openai_tools()
     try:
-        resp = await asyncio.to_thread(
-            _claude_call,
-            [{
-                "role": "user",
-                "content": [
+        for _ in range(4):
+            resp = await asyncio.to_thread(_groq_call, messages, tools)
+            msg = resp.choices[0].message
+            content = extract_answer(msg.content or "")
+            if content:
+                final_text = content
+            tool_calls = getattr(msg, "tool_calls", None)
+            if not tool_calls:
+                break
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in tool_calls
+                ],
+            })
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    args = {}
+                result, action = await _run_tool(chat_id, tc.function.name, args)
+                if action:
+                    actions.append(action)
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "name": tc.function.name, "content": result})
+        if not final_text:
+            final_text = "Listo. ✅" if actions else "No estoy seguro de qué necesitás. ¿Me lo repetís?"
+        store.add_history(chat_id, "user", user_message)
+        store.add_history(chat_id, "assistant", final_text)
+        return final_text, actions
+    except Exception as e:
+        logger.error(f"_ask_groq: {type(e).__name__}: {e}")
+        return (f"Tuve un problema para pensar la respuesta ({type(e).__name__}). Probá de nuevo en un momento.", actions)
+
+
+# ─── Visión: foto de comida → carbohidratos ──────────────────────
+FOOD_PROMPT = (
+    "Analizá esta foto de comida para una persona con diabetes tipo 1. "
+    "Estimá los carbohidratos totales. Respondé SOLO un JSON válido con esta forma:\n"
+    '{"descripcion": "qué ves, breve", "carbs_g": <número>, "confianza": "alta|media|baja", '
+    '"comentario": "1 frase útil, aclarando que es estimación"}\n'
+    "Nunca sugieras dosis de insulina."
+)
+FOOD_SYSTEM = "Sos un asistente nutricional preciso para diabetes tipo 1. Respondés solo JSON."
+
+
+def _parse_food_json(raw: str) -> tuple[str, Optional[float]]:
+    raw = (raw or "").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    data = json.loads(raw[start:end + 1]) if (start >= 0 and end > start) else {}
+    desc = data.get("descripcion", "comida")
+    carbs = data.get("carbs_g")
+    conf = data.get("confianza", "media")
+    comentario = data.get("comentario", "Es una estimación; puede variar según la porción real.")
+    texto = (f"🍽 {desc}\n"
+             f"🍞 Carbs estimados: ~{carbs}g (confianza {conf})\n"
+             f"ℹ️ {comentario}")
+    return texto, (float(carbs) if isinstance(carbs, (int, float)) else None)
+
+
+async def analyze_food_image(image_bytes: bytes, caption: str = "") -> tuple[str, Optional[float]]:
+    """Estima carbohidratos desde una foto. Enruta al proveedor configurado."""
+    provider = brain_provider()
+    if provider == "none":
+        return ("No puedo analizar fotos sin un cerebro configurado (GROQ_API_KEY o ANTHROPIC_API_KEY).", None)
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = FOOD_PROMPT + (f"\nComentario del usuario: {caption}" if caption else "")
+    try:
+        if provider == "anthropic":
+            resp = await asyncio.to_thread(
+                _claude_call,
+                [{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                     {"type": "text", "text": prompt},
-                ],
-            }],
-            None,  # sin tools
-            "Sos un asistente nutricional preciso para diabetes tipo 1. Respondés solo JSON.",
-            600,
-        )
-        raw = "".join(b.text for b in resp.content if b.type == "text").strip()
-        # Extraer el JSON aunque venga con texto alrededor
-        start, end = raw.find("{"), raw.rfind("}")
-        data = json.loads(raw[start:end + 1]) if start >= 0 else {}
-        desc = data.get("descripcion", "comida")
-        carbs = data.get("carbs_g")
-        conf = data.get("confianza", "media")
-        comentario = data.get("comentario", "Es una estimación; puede variar según la porción real.")
-        texto = (f"🍽 {desc}\n"
-                 f"🍞 Carbs estimados: ~{carbs}g (confianza {conf})\n"
-                 f"ℹ️ {comentario}")
-        return texto, (float(carbs) if isinstance(carbs, (int, float)) else None)
+                ]}],
+                None, FOOD_SYSTEM, 600,
+            )
+            raw = "".join(b.text for b in resp.content if b.type == "text")
+        else:  # groq: modelo de visión (qwen)
+            resp = await asyncio.to_thread(
+                _groq_call,
+                [{"role": "system", "content": FOOD_SYSTEM},
+                 {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                 ]}],
+                None, GROQ_VISION_MODEL, 700, 0.3,
+            )
+            raw = extract_answer(resp.choices[0].message.content or "")
+        return _parse_food_json(raw)
     except Exception as e:
         logger.error(f"analyze_food_image: {type(e).__name__}: {e}")
         return ("No pude analizar bien la foto. Probá con más luz o incluí un cubierto de referencia.", None)
@@ -959,19 +1078,26 @@ async def cmd_patrones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     treatments = await get_treatments(24 * 14)
     p = analyze_patterns(entries, treatments, 14)
     digest = format_patterns_digest(p, compact=False)
-    # Que Claude lo narre para la consulta con el endocrinólogo, si está disponible.
-    if anthropic_client and p["daily"]:
+    # Que el cerebro lo narre para la consulta con el endocrinólogo, si está disponible.
+    if brain_provider() != "none" and p["daily"]:
         try:
-            resp = await asyncio.to_thread(
-                _claude_call,
-                [{"role": "user", "content":
-                    "Estos son los patrones de glucosa de Vittore (14 días). Escribí un resumen "
-                    "breve y claro (máx 10 líneas, español argentino, sin tablas) para que el papá "
-                    "lo comente con el endocrinólogo. Destacá riesgos (hipos nocturnas, ejercicio) "
-                    "y lo que mejoró. NO sugieras dosis.\n\n" + digest}],
-                None, SYSTEM_PROMPT, 500,
+            narr_prompt = (
+                "Estos son los patrones de glucosa de Vittore (14 días). Escribí un resumen "
+                "breve y claro (máx 10 líneas, español argentino, sin tablas) para que el papá "
+                "lo comente con el endocrinólogo. Destacá riesgos (hipos nocturnas, ejercicio) "
+                "y lo que mejoró. NO sugieras dosis.\n\n" + digest
             )
-            narr = "".join(b.text for b in resp.content if b.type == "text").strip()
+            if brain_provider() == "anthropic":
+                resp = await asyncio.to_thread(
+                    _claude_call, [{"role": "user", "content": narr_prompt}], None, SYSTEM_PROMPT, 500)
+                narr = "".join(b.text for b in resp.content if b.type == "text").strip()
+            else:
+                resp = await asyncio.to_thread(
+                    _groq_call,
+                    [{"role": "system", "content": SYSTEM_PROMPT},
+                     {"role": "user", "content": narr_prompt}],
+                    None, None, 500, 0.5)
+                narr = extract_answer(resp.choices[0].message.content or "")
             await update.message.reply_text(narr or digest)
             return
         except Exception as e:
@@ -1184,9 +1310,8 @@ def main():
     # Resumen diario a las 22:30 hora Argentina
     app.job_queue.run_daily(daily_evening_summary, time=dtime(22, 30, tzinfo=TZ_AR))
 
-    brain = f"Claude ({ANTHROPIC_MODEL})" if anthropic_client else "SIN cerebro (falta ANTHROPIC_API_KEY)"
     persist = "MongoDB" if store.db is not None else "RAM"
-    logger.info(f"VittoreD1Bot v5 iniciado ✓ | cerebro: {brain} | persistencia: {persist}")
+    logger.info(f"VittoreD1Bot v5 iniciado ✓ | cerebro: {brain_label()} | persistencia: {persist}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

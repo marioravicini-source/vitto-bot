@@ -43,10 +43,20 @@ implementado.
 
 ## 2. Qué cambié (v5)
 
-**Cerebro = Claude.** Chat y estimación de carbohidratos por foto ahora usan
-**`claude-sonnet-4-6`**. Groq queda únicamente para transcribir los audios
-(Whisper). Si por algún motivo no hay clave de Claude, el bot sigue funcionando
-con los comandos básicos y avisa que falta configurarla.
+**Cerebro configurable (por defecto Groq gratis).** El chat y la estimación de
+carbohidratos por foto usan un modelo mucho más capaz que el `gpt-oss-20b`
+original. El proveedor se elige con la variable `LLM_PROVIDER`:
+
+- `groq` (por defecto, **gratis**): chat con **`openai/gpt-oss-120b`** (6× más
+  grande que el que teníamos y con razonamiento), visión con
+  **`qwen/qwen3.6-27b`** y audio con Whisper. Requiere `GROQ_API_KEY` (capa
+  gratuita de Groq). Se puede cambiar el modelo con `GROQ_CHAT_MODEL` (p. ej.
+  `moonshotai/kimi-k2-instruct`).
+- `anthropic` (de pago, más inteligente): chat y visión con
+  **`claude-sonnet-4-6`**. Requiere `ANTHROPIC_API_KEY` con crédito cargado.
+
+En Groq, Llama 3.3 70B y Llama 4 dejaron de ser gratis; `gpt-oss-120b` es hoy la
+mejor opción gratuita con soporte de herramientas.
 
 **Razonamiento real en el prompt.** El sistema instruye a Claude a correlacionar
 datos, anticipar subidas/bajadas, usar los patrones y cerrar con una
@@ -93,23 +103,27 @@ Atlas que ya tenés. Si no hay `MONGODB_URI`, usa RAM como antes.
 | `TELEGRAM_TOKEN` | sí | Token del bot (ya lo tenías). |
 | `NIGHTSCOUT_URL` | sí | URL de Nightscout (ya lo tenías). |
 | `NIGHTSCOUT_API_SECRET` | sí | Secret de Nightscout (ya lo tenías). |
-| **`ANTHROPIC_API_KEY`** | **sí (nueva)** | Clave de la API de Claude. **Es lo que enciende la inteligencia.** |
+| **`GROQ_API_KEY`** | **sí (modo gratis)** | Clave de Groq (capa gratuita). Enciende chat, visión y audio. |
+| `LLM_PROVIDER` | no | `groq` (por defecto, gratis) o `anthropic` (Claude, de pago). |
+| `GROQ_CHAT_MODEL` | no | Por defecto `openai/gpt-oss-120b`. Alternativa: `moonshotai/kimi-k2-instruct`. |
+| `GROQ_VISION_MODEL` | no | Por defecto `qwen/qwen3.6-27b` (fotos de comida). |
+| `ANTHROPIC_API_KEY` | solo si `LLM_PROVIDER=anthropic` | Clave de Claude **con crédito cargado**. |
 | `ANTHROPIC_MODEL` | no | Por defecto `claude-sonnet-4-6`. |
-| `GROQ_API_KEY` | no | Solo para transcribir audios (Whisper). |
 | `MONGODB_URI` | recomendada | Para que no pierda la memoria al reiniciar. Usá la misma de tu `.env`. |
 | `ALLOWED_USERS` | sí | Chat IDs autorizados, separados por coma. |
 | `CAREGIVER_CHAT_IDS` | no | A quién van las alertas (por defecto, los de `ALLOWED_USERS`). |
 | `BG_LOW`/`BG_HIGH`/`BG_URGENT_LOW`/`BG_URGENT_HIGH` | no | Umbrales; **confirmalos con el endocrinólogo**. |
 
-> La clave nueva y crítica es **`ANTHROPIC_API_KEY`**. Sin ella el bot corre,
-> pero en "modo básico" (comandos, sin conversación inteligente).
+> Modo gratis (por defecto): alcanza con **`GROQ_API_KEY`**. Si querés pasar a
+> Claude (más inteligente, de pago) poné `LLM_PROVIDER=anthropic` y
+> `ANTHROPIC_API_KEY` con crédito.
 
 ### 3.2 Pasos
 
-1. En Railway, agregá `ANTHROPIC_API_KEY` (y `MONGODB_URI` si querés
-   persistencia). El resto ya lo tenés.
+1. En Railway, asegurate de tener **`GROQ_API_KEY`** (modo gratis) y, si querés
+   persistencia, `MONGODB_URI`. El resto ya lo tenés.
 2. Se actualizó `requirements.txt` (agrega `anthropic` y `pymongo`).
-3. `git add . && git commit -m "v5: cerebro Claude, registro por tools, patrones y alertas inteligentes" && git push`. Railway redepliega solo.
+3. `git add . && git commit && git push`. Railway redepliega solo.
 4. Probá en Telegram: `/patrones`, mandale una foto de comida, contale "comí
    una pizza y me puse insulina", y dejá que corra para ver las alertas.
 
