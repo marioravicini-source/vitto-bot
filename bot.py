@@ -1,24 +1,40 @@
 """
-VittoreD1Bot — Agente conversacional para diabetes tipo 1
-Lee datos de glucosa de Nightscout y responde por Telegram usando Groq.
-Soporta: texto, audio, fotos de comida (estimación de carbohidratos),
-registro de comidas/insulina, memoria conversacional.
+VittoreD1Bot v5 — Agente conversacional para diabetes tipo 1
+============================================================
+Lee datos de Nightscout y acompaña por Telegram usando Claude como cerebro.
 
-REGLA DE SEGURIDAD ABSOLUTA:
+Cambios v5 (por qué el bot ahora "piensa"):
+  1. CEREBRO: Claude (claude-sonnet-4-6) para chat y visión, en lugar de un
+     modelo chico. Groq queda solo para transcribir audio (Whisper).
+  2. REGISTRO CONFIABLE: en vez de adivinar por palabras clave, Claude usa
+     "herramientas" (tools) y decide con qué eventType y datos registrar en
+     Nightscout. El registro del día se LEE desde Nightscout (fuente de
+     verdad), así no se pierde al reiniciar.
+  3. PATRONES: análisis multi-día (tiempo en rango por día, hipoglucemias
+     nocturnas, picos post-comida, caídas post-ejercicio) -> /patrones y
+     contexto para el chat.
+  4. PROACTIVIDAD: alertas predictivas por tendencia + insulina activa,
+     anti-spam (solo avisa en cambios de estado), aviso de sensor caído,
+     recordatorio post-ejercicio y resumen diario.
+  5. MEMORIA: conversación y perfil aprendido persistidos en MongoDB (si hay
+     MONGODB_URI); si no, memoria en RAM como antes.
+
+⛔ REGLA DE SEGURIDAD ABSOLUTA (no se negocia):
 Este bot NUNCA calcula, sugiere ni recomienda dosis de insulina.
-Solo informa, registra y alerta.
+Solo informa, registra, recuerda y alerta. Las dosis las define el
+endocrinólogo.
 """
 
 import os
 import io
-import re
-import base64
 import json
+import base64
 import asyncio
-import hashlib
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+import hashlib
+import statistics
+from datetime import datetime, timezone, timedelta, time as dtime
+from typing import Optional, Any
 from collections import defaultdict
 
 import httpx
@@ -30,14 +46,40 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from groq import Groq
+
+# ─── Dependencias opcionales ─────────────────────────────────────
+try:
+    from anthropic import Anthropic
+except Exception:  # pragma: no cover
+    Anthropic = None
+
+try:
+    from groq import Groq
+except Exception:  # pragma: no cover
+    Groq = None
+
+try:
+    from pymongo import MongoClient
+except Exception:  # pragma: no cover
+    MongoClient = None
+
 
 # ─── Configuración ───────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-NIGHTSCOUT_URL = os.environ["NIGHTSCOUT_URL"]
+NIGHTSCOUT_URL = os.environ["NIGHTSCOUT_URL"].rstrip("/")
 NIGHTSCOUT_API_SECRET = os.environ.get("NIGHTSCOUT_API_SECRET", "")
-ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "").split(",")
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # solo para audio (Whisper)
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+
+ALLOWED_USERS = [u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",") if u.strip()]
+# A quién van las alertas automáticas. Por defecto, los mismos usuarios permitidos.
+CAREGIVER_CHAT_IDS = [
+    c.strip() for c in os.environ.get("CAREGIVER_CHAT_IDS", ",".join(ALLOWED_USERS)).split(",") if c.strip()
+]
 
 # Umbrales de glucosa (mg/dL)
 BG_HIGH = int(os.environ.get("BG_HIGH", "180"))
@@ -45,9 +87,12 @@ BG_LOW = int(os.environ.get("BG_LOW", "70"))
 BG_URGENT_HIGH = int(os.environ.get("BG_URGENT_HIGH", "250"))
 BG_URGENT_LOW = int(os.environ.get("BG_URGENT_LOW", "55"))
 
-# Modelos Groq
-CHAT_MODEL = "openai/gpt-oss-20b"
-VISION_MODEL = "qwen/qwen3.6-27b"
+# Ventana de predicción (minutos) para el aviso preventivo de baja
+PREDICT_MIN = int(os.environ.get("PREDICT_MIN", "20"))
+# Minutos sin datos del sensor para avisar "sensor caído"
+SENSOR_GAP_MIN = int(os.environ.get("SENSOR_GAP_MIN", "20"))
+# Cooldown para re-avisar el mismo estado malo (minutos)
+ALERT_COOLDOWN_MIN = int(os.environ.get("ALERT_COOLDOWN_MIN", "30"))
 
 # Zona horaria Argentina
 TZ_AR = timezone(timedelta(hours=-3))
@@ -59,149 +104,213 @@ logging.basicConfig(
 logger = logging.getLogger("VittoBot")
 
 # ─── Clientes ────────────────────────────────────────────────────
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (Anthropic and ANTHROPIC_API_KEY) else None
+groq_client = Groq(api_key=GROQ_API_KEY) if (Groq and GROQ_API_KEY) else None
 
-# ─── Memoria conversacional ──────────────────────────────────────
-conversation_history: dict[int, list[dict]] = defaultdict(list)
-MAX_HISTORY = 20
-
-# Registro diario: comidas, insulina, notas
-daily_log: dict[int, list[dict]] = defaultdict(list)
+if not anthropic_client:
+    logger.warning("⚠ Sin ANTHROPIC_API_KEY: el chat inteligente está deshabilitado. "
+                   "Configurá ANTHROPIC_API_KEY en Railway.")
 
 
-def add_to_history(chat_id: int, role: str, content: str):
-    """Agrega un mensaje al historial de conversación."""
-    conversation_history[chat_id].append({"role": role, "content": content})
-    if len(conversation_history[chat_id]) > MAX_HISTORY:
-        conversation_history[chat_id] = conversation_history[chat_id][-MAX_HISTORY:]
+# ─── Persistencia (MongoDB opcional, con fallback en RAM) ────────
+class Store:
+    """Guarda historial de conversación, perfil aprendido y estado de alertas.
+
+    Usa MongoDB si hay MONGODB_URI; si no, memoria en RAM (se pierde al
+    reiniciar, como antes)."""
+
+    def __init__(self, uri: str):
+        self._mem_history: dict[int, list[dict]] = defaultdict(list)
+        self._mem_profile: dict[int, dict] = defaultdict(dict)
+        self._mem_alert: dict = {}
+        self.db = None
+        if uri and MongoClient:
+            try:
+                client = MongoClient(uri, serverSelectionTimeoutMS=5000, appname="VittoBot")
+                client.admin.command("ping")
+                self.db = client["vittobot"]
+                logger.info("✓ Conectado a MongoDB para persistencia.")
+            except Exception as e:
+                logger.error(f"No pude conectar a MongoDB, uso memoria en RAM: {e}")
+                self.db = None
+
+    # -- Historial de conversación --
+    def get_history(self, chat_id: int, limit: int = 20) -> list[dict]:
+        if self.db is not None:
+            try:
+                docs = list(
+                    self.db.history.find({"chat_id": chat_id})
+                    .sort("ts", -1)
+                    .limit(limit)
+                )
+                docs.reverse()
+                return [{"role": d["role"], "content": d["content"]} for d in docs]
+            except Exception as e:
+                logger.error(f"get_history: {e}")
+                return []
+        return list(self._mem_history[chat_id])[-limit:]
+
+    def add_history(self, chat_id: int, role: str, content: str):
+        if self.db is not None:
+            try:
+                self.db.history.insert_one({
+                    "chat_id": chat_id,
+                    "role": role,
+                    "content": content,
+                    "ts": datetime.now(timezone.utc),
+                })
+                return
+            except Exception as e:
+                logger.error(f"add_history: {e}")
+        h = self._mem_history[chat_id]
+        h.append({"role": role, "content": content})
+        if len(h) > 40:
+            self._mem_history[chat_id] = h[-40:]
+
+    # -- Perfil aprendido (comidas habituales, rutina, apodo, etc.) --
+    def get_profile(self, chat_id: int) -> dict:
+        if self.db is not None:
+            try:
+                doc = self.db.profile.find_one({"chat_id": chat_id})
+                return (doc or {}).get("data", {})
+            except Exception as e:
+                logger.error(f"get_profile: {e}")
+                return {}
+        return dict(self._mem_profile[chat_id])
+
+    def update_profile(self, chat_id: int, key: str, value: Any):
+        if self.db is not None:
+            try:
+                self.db.profile.update_one(
+                    {"chat_id": chat_id},
+                    {"$set": {f"data.{key}": value}},
+                    upsert=True,
+                )
+                return
+            except Exception as e:
+                logger.error(f"update_profile: {e}")
+        self._mem_profile[chat_id][key] = value
+
+    # -- Estado de alertas (para anti-spam, sobrevive reinicios) --
+    def get_alert_state(self) -> dict:
+        if self.db is not None:
+            try:
+                return self.db.state.find_one({"_id": "alert"}) or {}
+            except Exception as e:
+                logger.error(f"get_alert_state: {e}")
+                return {}
+        return dict(self._mem_alert)
+
+    def set_alert_state(self, state: dict):
+        state = dict(state)
+        if self.db is not None:
+            try:
+                self.db.state.update_one({"_id": "alert"}, {"$set": state}, upsert=True)
+                return
+            except Exception as e:
+                logger.error(f"set_alert_state: {e}")
+        self._mem_alert.update(state)
 
 
-def add_to_daily_log(chat_id: int, entry_type: str, detail: str):
-    """Registra una entrada en el log diario."""
-    now = datetime.now(TZ_AR)
-    daily_log[chat_id].append({
-        "tipo": entry_type,
-        "detalle": detail,
-        "hora": now.strftime("%H:%M"),
-        "fecha": now.strftime("%Y-%m-%d"),
-    })
+store = Store(MONGODB_URI)
 
 
-def get_daily_log_summary(chat_id: int) -> str:
-    """Resumen del log diario."""
-    today = datetime.now(TZ_AR).strftime("%Y-%m-%d")
-    entries = [e for e in daily_log[chat_id] if e["fecha"] == today]
-    if not entries:
-        return "No hay registros de hoy."
-
-    lines = [f"Registros de hoy ({today}):"]
-    for e in entries:
-        emoji = {"comida": "🍽", "insulina": "💉", "nota": "📝", "ejercicio": "🏃"}.get(e["tipo"], "•")
-        lines.append(f"{emoji} {e['hora']} — {e['tipo'].capitalize()}: {e['detalle']}")
-    return "\n".join(lines)
+# ─── Nightscout: headers y lecturas ──────────────────────────────
+def _ns_headers() -> dict:
+    headers = {}
+    if NIGHTSCOUT_API_SECRET:
+        headers["api-secret"] = hashlib.sha1(
+            NIGHTSCOUT_API_SECRET.encode("utf-8")
+        ).hexdigest()
+    return headers
 
 
-SYSTEM_PROMPT = """Sos VittoBot, asistente de diabetes tipo 1 para Vittore (15 años).
-
-PACIENTE: Apidra (rápida, DIA ~3-4h) + Glargina (basal). Sensor FreeStyle Libre. Unidades: mg/dL. Zona: Argentina UTC-3.
-
-⛔ REGLA DE SEGURIDAD ABSOLUTA:
-NUNCA calculés, sugerís ni recomendés dosis de insulina. NUNCA digás "podrías ponerte X unidades".
-Si preguntan por dosis: "Eso lo decide el endocrinólogo. Yo te muestro los datos."
-
-RANGOS: En rango 70-180 | Bajo <70 | Alto >180 | Urgente bajo <55 | Urgente alto >250
-
-FORMATO DE RESPUESTA (obligatorio para Telegram):
-- NUNCA uses tablas markdown (| col | col |). Telegram no las renderiza.
-- Usá texto plano con emojis como separadores visuales.
-- Sé CONCISO: máximo 15 líneas. No repitas datos que el usuario ya ve en su app.
-- Cuando des un resumen de glucosa, usá este formato compacto:
-
-🩸 Glucosa: 148 mg/dL → estable 🟢
-📊 Últimas 6h: prom 151 · rango 101-241 · 78% en rango
-⚠️ 8 lecturas altas · 0 bajas
-
-- Para tratamientos, formato compacto:
-💉 17:28 Apidra 4U (corrección) · 18:41 Apidra 5U
-🍽 18:38 Tostadas + huevos (~40g carbs)
-
-ANÁLISIS INTELIGENTE:
-- Correlacioná datos: si hubo pico alto seguido de corrección, mencionalo.
-- Identificá patrones: "subió después de comer y bajó bien con la corrección".
-- Si la glucosa lleva mucho tiempo alta o baja, priorizá eso.
-- Cerrá con UNA observación útil, no con frases genéricas tipo "todo bien, avisame".
-- Ejemplo bueno: "La corrección de las 17:28 tardó ~1h en bajar de 180. Buen control post-cena."
-- Ejemplo malo: "Todo indica que la glucosa estuvo bien controlada hoy. Si necesitas algo más, avísame. 🌟"
-
-REGISTRO:
-Cuando mencionen comida/insulina/ejercicio/nota, confirmá en 1 línea:
-"✅ Registrado: 🍽 Pasta (~60g carbs)" — sin explicaciones extras.
-
-ESTILO: Español argentino, directo, cálido pero no empalagoso. Pocos emojis (máx 5 por mensaje).
-Priorizá la info útil sobre la cortesía. No arranques con "¡Hola! 👋 Aquí tienes..."."""
-
-VISION_PROMPT = """Sos un asistente nutricional para una persona con diabetes tipo 1.
-Analizá esta foto de comida y estimá los carbohidratos (hidratos de carbono).
-
-Respondé en español con este formato:
-1. Qué ves en la foto (describí los alimentos)
-2. Estimación de carbohidratos por alimento (en gramos)
-3. Total estimado de carbohidratos
-
-IMPORTANTE:
-- Aclarás que es una ESTIMACIÓN y puede variar según porciones reales.
-- NUNCA sugerís dosis de insulina.
-- Si no podés identificar bien la comida, pedí más detalles.
-- Sé conciso y claro."""
+async def _ns_get(path: str, params: Optional[dict] = None) -> Any:
+    async with httpx.AsyncClient(timeout=12) as client:
+        resp = await client.get(f"{NIGHTSCOUT_URL}{path}", headers=_ns_headers(), params=params)
+        resp.raise_for_status()
+        return resp.json()
 
 
-def extract_answer(text: str) -> str:
-    """Extrae la respuesta final, descartando el bloque <think>."""
-    if not text:
-        return ""
-    # Si hay </think>, la respuesta está después
-    if "</think>" in text:
-        return text.split("</think>", 1)[1].strip()
-    # Si hay <think> sin cierre (se quedó sin tokens), devolver el contenido
-    if "<think>" in text:
-        return text.replace("<think>", "").strip()
-    return text.strip()
-
-
-# ─── Funciones de Nightscout ─────────────────────────────────────
 async def get_current_bg() -> Optional[dict]:
-    """Obtiene la última lectura de glucosa de Nightscout."""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{NIGHTSCOUT_URL}/api/v1/entries/current.json",
-                headers=_ns_headers(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data and len(data) > 0:
-                return data[0]
+        data = await _ns_get("/api/v1/entries/current.json")
+        if data:
+            return data[0]
     except Exception as e:
-        logger.error(f"Error consultando Nightscout: {e}")
+        logger.error(f"get_current_bg: {e}")
     return None
 
 
 async def get_recent_entries(hours: int = 3) -> list:
-    """Obtiene las lecturas de las últimas N horas."""
     try:
-        count = hours * 12
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{NIGHTSCOUT_URL}/api/v1/entries.json?count={count}",
-                headers=_ns_headers(),
-            )
-            resp.raise_for_status()
-            return resp.json()
+        return await _ns_get("/api/v1/entries.json", {"count": hours * 12})
     except Exception as e:
-        logger.error(f"Error consultando historial: {e}")
+        logger.error(f"get_recent_entries: {e}")
     return []
 
 
+async def get_entries_days(days: int = 14) -> list:
+    """Lecturas SGV de los últimos N días para análisis de patrones."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        params = {
+            "find[dateString][$gte]": since.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "count": days * 288 + 50,  # 288 lecturas/día aprox.
+        }
+        return await _ns_get("/api/v1/entries/sgv.json", params)
+    except Exception as e:
+        logger.error(f"get_entries_days: {e}")
+    return []
+
+
+async def get_treatments(hours: int = 6) -> list:
+    try:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        params = {
+            "find[created_at][$gte]": since.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "count": 100,
+        }
+        return await _ns_get("/api/v1/treatments.json", params)
+    except Exception as e:
+        logger.error(f"get_treatments: {e}")
+    return []
+
+
+async def get_device_status() -> Optional[dict]:
+    try:
+        data = await _ns_get("/api/v1/devicestatus.json", {"count": 1})
+        if data:
+            return data[0]
+    except Exception as e:
+        logger.error(f"get_device_status: {e}")
+    return None
+
+
+async def post_treatment(event_type: str, **kwargs) -> bool:
+    try:
+        now = datetime.now(timezone.utc)
+        treatment = {
+            "eventType": event_type,
+            "created_at": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "enteredBy": "VittoBot",
+        }
+        treatment.update({k: v for k, v in kwargs.items() if v is not None})
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.post(
+                f"{NIGHTSCOUT_URL}/api/v1/treatments",
+                headers=_ns_headers(),
+                json=treatment,
+            )
+            resp.raise_for_status()
+            logger.info(f"Treatment NS: {event_type} {kwargs}")
+            return True
+    except Exception as e:
+        logger.error(f"post_treatment: {type(e).__name__}: {e}")
+    return False
+
+
+# ─── Formato y clasificación ─────────────────────────────────────
 def format_direction(direction: str) -> str:
     arrows = {
         "DoubleUp": "⬆⬆ subiendo rápido",
@@ -217,154 +326,62 @@ def format_direction(direction: str) -> str:
     return arrows.get(direction, direction or "?")
 
 
+def classify_bg(sgv: int) -> str:
+    if sgv <= BG_URGENT_LOW:
+        return "urgent_low"
+    if sgv < BG_LOW:
+        return "low"
+    if sgv >= BG_URGENT_HIGH:
+        return "urgent_high"
+    if sgv > BG_HIGH:
+        return "high"
+    return "in_range"
+
+
+def bg_indicator(sgv: int) -> str:
+    return {
+        "urgent_low": "🔴 URGENTE BAJO",
+        "low": "🟡 BAJO",
+        "in_range": "🟢 En rango",
+        "high": "🟠 ALTO",
+        "urgent_high": "🔴 URGENTE ALTO",
+    }[classify_bg(sgv)]
+
+
 def format_bg_message(entry: dict) -> str:
     sgv = entry.get("sgv", 0)
     direction = entry.get("direction", "")
     date_ms = entry.get("date", 0)
-
     dt = datetime.fromtimestamp(date_ms / 1000, tz=TZ_AR)
-    time_str = dt.strftime("%H:%M")
-
-    if sgv <= BG_URGENT_LOW:
-        indicator = "🔴 URGENTE BAJO"
-    elif sgv <= BG_LOW:
-        indicator = "🟡 BAJO"
-    elif sgv >= BG_URGENT_HIGH:
-        indicator = "🔴 URGENTE ALTO"
-    elif sgv >= BG_HIGH:
-        indicator = "🟠 ALTO"
-    else:
-        indicator = "🟢 En rango"
-
     mins_ago = int((datetime.now(TZ_AR) - dt).total_seconds() / 60)
-
     return (
-        f"**Glucosa: {sgv} mg/dL** {indicator}\n"
+        f"🩸 Glucosa: {sgv} mg/dL — {bg_indicator(sgv)}\n"
         f"Tendencia: {format_direction(direction)}\n"
-        f"Hora: {time_str} (hace {mins_ago} min)"
+        f"Hora: {dt.strftime('%H:%M')} (hace {mins_ago} min)"
     )
 
 
 def summarize_entries(entries: list) -> str:
-    if not entries:
-        return "No hay datos recientes."
-
     values = [e.get("sgv", 0) for e in entries if e.get("sgv")]
     if not values:
-        return "No hay datos de glucosa disponibles."
-
+        return "No hay datos de glucosa recientes."
     avg = sum(values) / len(values)
-    high_count = sum(1 for v in values if v > BG_HIGH)
-    low_count = sum(1 for v in values if v < BG_LOW)
-    in_range = len(values) - high_count - low_count
-    pct_in_range = (in_range / len(values)) * 100
-
-    first_time = datetime.fromtimestamp(entries[-1].get("date", 0) / 1000, tz=TZ_AR)
-    last_time = datetime.fromtimestamp(entries[0].get("date", 0) / 1000, tz=TZ_AR)
-
+    high = sum(1 for v in values if v > BG_HIGH)
+    low = sum(1 for v in values if v < BG_LOW)
+    in_range = len(values) - high - low
+    pct = in_range / len(values) * 100
+    first = datetime.fromtimestamp(entries[-1].get("date", 0) / 1000, tz=TZ_AR)
+    last = datetime.fromtimestamp(entries[0].get("date", 0) / 1000, tz=TZ_AR)
     return (
-        f"Resumen ({first_time.strftime('%H:%M')} - {last_time.strftime('%H:%M')}):\n"
-        f"- Lecturas: {len(values)}\n"
-        f"- Promedio: {avg:.0f} mg/dL\n"
-        f"- Mín/Máx: {min(values)}/{max(values)} mg/dL\n"
-        f"- En rango: {pct_in_range:.0f}%\n"
-        f"- Altos (>{BG_HIGH}): {high_count} | Bajos (<{BG_LOW}): {low_count}"
+        f"📊 {first.strftime('%H:%M')}–{last.strftime('%H:%M')}: "
+        f"prom {avg:.0f} · rango {min(values)}-{max(values)} · {pct:.0f}% en rango\n"
+        f"⚠️ {high} altas · {low} bajas ({len(values)} lecturas)"
     )
 
 
-# ─── Funciones adicionales de Nightscout ─────────────────────────
-def _ns_headers() -> dict:
-    """Headers comunes para las requests a Nightscout (SHA1 del secret)."""
-    headers = {}
-    if NIGHTSCOUT_API_SECRET:
-        headers["api-secret"] = hashlib.sha1(
-            NIGHTSCOUT_API_SECRET.encode("utf-8")
-        ).hexdigest()
-    return headers
-
-
-async def get_treatments(hours: int = 6) -> list:
-    """Obtiene tratamientos recientes (insulina, carbs, notas, etc.)."""
-    try:
-        since = datetime.now(timezone.utc) - timedelta(hours=hours)
-        params = {
-            "find[created_at][$gte]": since.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "count": 50,
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{NIGHTSCOUT_URL}/api/v1/treatments.json",
-                headers=_ns_headers(),
-                params=params,
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as e:
-        logger.error(f"Error consultando treatments: {e}")
-    return []
-
-
-async def get_device_status() -> Optional[dict]:
-    """Obtiene el último devicestatus (IOB, COB, batería, etc.)."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{NIGHTSCOUT_URL}/api/v1/devicestatus.json?count=1",
-                headers=_ns_headers(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data and len(data) > 0:
-                return data[0]
-    except Exception as e:
-        logger.error(f"Error consultando devicestatus: {e}")
-    return None
-
-
-async def get_profile() -> Optional[dict]:
-    """Obtiene el perfil activo del paciente."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{NIGHTSCOUT_URL}/api/v1/profile/current",
-                headers=_ns_headers(),
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as e:
-        logger.error(f"Error consultando profile: {e}")
-    return None
-
-
-async def post_treatment(event_type: str, **kwargs) -> bool:
-    """Registra un tratamiento en Nightscout."""
-    try:
-        now = datetime.now(timezone.utc)
-        treatment = {
-            "eventType": event_type,
-            "created_at": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "enteredBy": "VittoBot",
-        }
-        treatment.update(kwargs)
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{NIGHTSCOUT_URL}/api/v1/treatments",
-                headers=_ns_headers(),
-                json=treatment,
-            )
-            resp.raise_for_status()
-            logger.info(f"Treatment registrado en NS: {event_type}")
-            return True
-    except Exception as e:
-        logger.error(f"Error registrando treatment: {type(e).__name__}: {e}")
-    return False
-
-
 def format_treatments(treatments: list) -> str:
-    """Formatea tratamientos para mostrar/enviar al LLM."""
     if not treatments:
-        return "No hay tratamientos recientes."
-
+        return "Sin tratamientos recientes."
     lines = []
     for t in treatments:
         created = t.get("created_at", "")
@@ -373,44 +390,27 @@ def format_treatments(treatments: list) -> str:
             time_str = dt.strftime("%H:%M")
         except Exception:
             time_str = created[:16] if created else "?"
-
-        event = t.get("eventType", "?")
-        parts = [f"{time_str} — {event}"]
-
-        insulin = t.get("insulin")
-        if insulin:
-            parts.append(f"💉 {insulin}U")
-        carbs = t.get("carbs")
-        if carbs:
-            parts.append(f"🍞 {carbs}g carbs")
-        notes = t.get("notes")
-        if notes:
-            parts.append(f"📝 {notes}")
-        glucose = t.get("glucose")
-        if glucose:
-            parts.append(f"🩸 {glucose} mg/dL")
-        duration = t.get("duration")
-        if duration:
-            parts.append(f"⏱ {duration} min")
-
-        lines.append(" | ".join(parts))
-
-    return "Tratamientos recientes:\n" + "\n".join(lines)
+        parts = [f"{time_str} — {t.get('eventType', '?')}"]
+        if t.get("insulin"):
+            parts.append(f"💉 {t['insulin']}U")
+        if t.get("carbs"):
+            parts.append(f"🍞 {t['carbs']}g")
+        if t.get("duration"):
+            parts.append(f"⏱ {t['duration']}min")
+        if t.get("glucose"):
+            parts.append(f"🩸 {t['glucose']}")
+        if t.get("notes"):
+            parts.append(f"📝 {t['notes']}")
+        lines.append(" · ".join(parts))
+    return "\n".join(lines)
 
 
-def format_iob_cob(device_status: Optional[dict]) -> str:
-    """Extrae IOB y COB del devicestatus."""
+def extract_iob_cob(device_status: Optional[dict]) -> tuple[Optional[float], Optional[float]]:
+    """Devuelve (IOB, COB) desde devicestatus si existen."""
     if not device_status:
-        return ""
-
-    parts = []
-
-    # IOB puede estar en pump.iob o en openaps.iob o en loop.iob
-    iob = None
-    cob = None
-
-    # OpenAPS / Loop
-    for key in ["openaps", "loop"]:
+        return None, None
+    iob = cob = None
+    for key in ("openaps", "loop"):
         section = device_status.get(key, {})
         if isinstance(section, dict):
             iob_data = section.get("iob", {})
@@ -421,8 +421,6 @@ def format_iob_cob(device_status: Optional[dict]) -> str:
             enacted = section.get("enacted", section.get("suggested", {}))
             if isinstance(enacted, dict) and cob is None:
                 cob = enacted.get("COB")
-
-    # Pump IOB
     pump = device_status.get("pump", {})
     if isinstance(pump, dict) and iob is None:
         pump_iob = pump.get("iob", {})
@@ -430,174 +428,447 @@ def format_iob_cob(device_status: Optional[dict]) -> str:
             iob = pump_iob.get("iob", pump_iob.get("bolusiob"))
         elif isinstance(pump_iob, (int, float)):
             iob = pump_iob
-
-    if iob is not None:
-        parts.append(f"IOB: {iob:.1f}U")
-    if cob is not None:
-        parts.append(f"COB: {cob:.0f}g")
-
-    return " | ".join(parts) if parts else ""
+    return (float(iob) if isinstance(iob, (int, float)) else None,
+            float(cob) if isinstance(cob, (int, float)) else None)
 
 
-# ─── Audio (Whisper) ─────────────────────────────────────────────
-async def transcribe_voice(file_bytes: bytes) -> str:
-    """Transcribe audio usando Whisper de Groq."""
-    if not groq_client:
-        return "[Error: No hay API key de Groq configurada]"
+# ─── Analítica: predicción y patrones ────────────────────────────
+def bg_slope(entries: list) -> Optional[float]:
+    """Pendiente reciente en mg/dL por minuto (negativa = bajando).
+
+    entries: lista de Nightscout (más nuevo primero)."""
+    pts = []
+    for e in entries[:4]:
+        sgv = e.get("sgv")
+        date_ms = e.get("date")
+        if sgv and date_ms:
+            pts.append((date_ms / 1000.0, sgv))
+    if len(pts) < 2:
+        return None
+    pts.sort()  # más viejo primero
+    (t0, v0), (t1, v1) = pts[0], pts[-1]
+    dt_min = (t1 - t0) / 60.0
+    if dt_min <= 0:
+        return None
+    return (v1 - v0) / dt_min
+
+
+def predict_bg(current_sgv: int, slope: Optional[float], minutes: int) -> Optional[int]:
+    if slope is None:
+        return None
+    return int(current_sgv + slope * minutes)
+
+
+def analyze_patterns(entries: list, treatments: list, days: int = 14) -> dict:
+    """Calcula métricas de patrones sobre los últimos N días."""
+    by_day: dict[str, list[int]] = defaultdict(list)
+    night: dict[str, list[int]] = defaultdict(list)  # 00:00–06:00
+    for e in entries:
+        sgv = e.get("sgv")
+        date_ms = e.get("date")
+        if not sgv or not date_ms:
+            continue
+        dt = datetime.fromtimestamp(date_ms / 1000, tz=TZ_AR)
+        day = dt.strftime("%Y-%m-%d")
+        by_day[day].append(sgv)
+        if dt.hour < 6:
+            night[day].append(sgv)
+
+    daily = []
+    for day in sorted(by_day):
+        vals = by_day[day]
+        tir = sum(1 for v in vals if BG_LOW <= v <= BG_HIGH) / len(vals) * 100
+        lows = sum(1 for v in vals if v < BG_LOW)
+        daily.append({
+            "day": day,
+            "n": len(vals),
+            "avg": round(statistics.mean(vals)),
+            "tir": round(tir),
+            "lows": lows,
+            "min": min(vals),
+            "max": max(vals),
+        })
+
+    nights_with_low = [d for d, vals in night.items() if any(v < BG_LOW for v in vals)]
+
+    # Ejercicios registrados y si hubo baja nocturna en la noche siguiente
+    exercises = []
+    for t in treatments:
+        if t.get("eventType") == "Exercise":
+            created = t.get("created_at", "")
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(TZ_AR)
+            except Exception:
+                continue
+            day = dt.strftime("%Y-%m-%d")
+            low_next_night = day in nights_with_low
+            exercises.append({
+                "day": day, "hora": dt.strftime("%H:%M"),
+                "notes": t.get("notes", ""), "low_madrugada": low_next_night,
+            })
+
+    valid = [d for d in daily if d["n"] >= 50]  # días con datos suficientes
+    avg_tir = round(statistics.mean([d["tir"] for d in valid])) if valid else None
+
+    return {
+        "days": days,
+        "daily": daily,
+        "avg_tir": avg_tir,
+        "nights_with_low": sorted(nights_with_low),
+        "exercises": exercises,
+    }
+
+
+def format_patterns_digest(p: dict, compact: bool = False) -> str:
+    if not p["daily"]:
+        return "Todavía no hay suficientes datos para detectar patrones."
+    lines = []
+    if p["avg_tir"] is not None:
+        lines.append(f"🎯 Tiempo en rango promedio ({p['days']}d): {p['avg_tir']}%")
+    recent = p["daily"][-7:]
+    if not compact:
+        lines.append("Por día (últimos):")
+        for d in recent:
+            flag = " ⚠️" if d["lows"] else ""
+            lines.append(f"  {d['day']}: TIR {d['tir']}% · prom {d['avg']} · {d['lows']} bajas{flag}")
+    n_low = len(p["nights_with_low"])
+    if n_low:
+        lines.append(f"🌙 Hipoglucemias de madrugada en {n_low} de los últimos {p['days']} días: "
+                     f"{', '.join(p['nights_with_low'][-5:])}")
+    ex_low = [e for e in p["exercises"] if e["low_madrugada"]]
+    if ex_low:
+        lines.append(f"🏒 En {len(ex_low)} de {len(p['exercises'])} días con ejercicio registrado "
+                     f"hubo baja de madrugada esa noche. Patrón a comentar con el endocrinólogo.")
+    return "\n".join(lines)
+
+
+# ─── Cerebro: Claude (chat con herramientas + visión) ────────────
+SYSTEM_PROMPT = f"""Sos VittoBot, el asistente de diabetes tipo 1 de Vittore, un adolescente de 15 años, deportista (hockey sobre patín y gimnasio). Le hablás a él y a veces a su papá (Mario).
+
+PACIENTE: insulina rápida Apidra (bolo, dura ~3-4h) + Glargina (basal, 1 vez al día). Sensor FreeStyle Libre. Unidades mg/dL. Zona horaria Argentina (UTC-3).
+
+⛔ REGLA DE SEGURIDAD ABSOLUTA — NUNCA la rompas:
+NUNCA calcules, sugieras ni recomiendes dosis de insulina. NUNCA digas "ponete X unidades" ni des un ratio o factor de corrección. Si te piden dosis, respondé: "Eso lo define tu endocrinólogo. Yo te muestro los datos para que decidas con sus pautas." Podés informar, registrar, recordar, alertar y explicar; nunca dosificar.
+
+RANGOS: en rango {BG_LOW}-{BG_HIGH} · bajo <{BG_LOW} · alto >{BG_HIGH} · urgente bajo ≤{BG_URGENT_LOW} · urgente alto ≥{BG_URGENT_HIGH}.
+
+CÓMO PENSAR (esto es lo que te hace útil, no un tablero):
+- Correlacioná: relacioná glucosa con comidas, insulina activa (IOB) y ejercicio del contexto. Ej: "venís bajando y todavía tenés insulina activa de la corrección de las 17:28, ojo".
+- Anticipá: si la tendencia va hacia una baja o suba, decilo antes de que pase.
+- Usá los PATRONES del contexto (hipos nocturnas post-hockey, picos post-comida) para dar avisos concretos y con memoria.
+- Cerrá con UNA observación útil, no con frases genéricas ("todo bien, avisame").
+
+REGISTRAR (usá las herramientas, no lo hagas a mano):
+Cuando Vittore cuente que comió, se aplicó insulina, hizo ejercicio, midió su glucosa capilar, o quiera dejar una nota/turno, LLAMÁ a la herramienta correspondiente con los datos que puedas extraer (gramos de carbohidratos si los sabés, unidades de insulina, minutos de ejercicio). Si falta un dato importante y es fácil, preguntá en una línea; si no, registrá con lo que hay. Después confirmá en 1 línea: "✅ Registrado: 🍽 Pasta (~60g)".
+
+MEMORIA: si aprendés algo estable y útil (comida habitual, horario de entrenamiento, cómo prefiere que le hablen, su apodo para vos), guardalo con recordar_dato.
+
+FORMATO TELEGRAM:
+- Nada de tablas markdown (Telegram no las renderiza). Usá texto plano y emojis como separadores.
+- Conciso: máximo ~12 líneas. No repitas datos crudos que ya ve en su app.
+- Español argentino, directo, cálido pero sin ser empalagoso ni sermonear. Máx 5 emojis.
+- No arranques con "¡Hola! 👋 Aquí tienes". Andá al grano con calidez.
+- Sin culpa ni reto: celebrá los logros, acompañá los momentos difíciles.
+
+Sos acompañamiento, no reemplazás al médico ni a la familia. Las estimaciones (carbs por foto, IOB, predicción) son aproximadas y las comunicás como tales."""
+
+TOOLS = [
+    {
+        "name": "registrar_comida",
+        "description": "Registra una comida/colación en Nightscout. Usar cuando el usuario cuenta que comió algo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "descripcion": {"type": "string", "description": "Qué comió, breve."},
+                "carbs_g": {"type": "number", "description": "Carbohidratos estimados en gramos, si se pueden inferir."},
+                "insulina_u": {"type": "number", "description": "Unidades de insulina que se aplicó junto a la comida, si las mencionó."},
+            },
+            "required": ["descripcion"],
+        },
+    },
+    {
+        "name": "registrar_insulina",
+        "description": "Registra una aplicación de insulina (bolo de corrección o basal) en Nightscout. NO sugiere dosis; solo registra lo que el usuario ya se aplicó.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "unidades": {"type": "number", "description": "Unidades aplicadas."},
+                "tipo": {"type": "string", "enum": ["correccion", "basal"], "description": "Corrección (Apidra) o basal (Glargina)."},
+                "nota": {"type": "string"},
+            },
+            "required": ["unidades"],
+        },
+    },
+    {
+        "name": "registrar_ejercicio",
+        "description": "Registra actividad física (hockey, gimnasio, etc.) en Nightscout.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "descripcion": {"type": "string"},
+                "duracion_min": {"type": "number"},
+            },
+            "required": ["descripcion"],
+        },
+    },
+    {
+        "name": "registrar_glucosa_capilar",
+        "description": "Registra una medición de glucosa hecha con tira/glucómetro (BG Check).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"valor": {"type": "number"}},
+            "required": ["valor"],
+        },
+    },
+    {
+        "name": "registrar_nota",
+        "description": "Registra una nota, recordatorio o turno médico en Nightscout.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"texto": {"type": "string"}},
+            "required": ["texto"],
+        },
+    },
+    {
+        "name": "recordar_dato",
+        "description": "Guarda en memoria un dato estable y útil sobre Vittore (comida habitual, horario de entrenamiento, preferencia de trato, apodo).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "clave": {"type": "string"},
+                "valor": {"type": "string"},
+            },
+            "required": ["clave", "valor"],
+        },
+    },
+]
+
+
+async def _run_tool(chat_id: int, name: str, args: dict) -> tuple[str, Optional[dict]]:
+    """Ejecuta una herramienta. Devuelve (resultado_para_claude, accion_registrada)."""
+    action = None
     try:
-        audio_file = io.BytesIO(file_bytes)
-        audio_file.name = "voice.ogg"
-        transcript = groq_client.audio.transcriptions.create(
-            model="whisper-large-v3",
-            file=audio_file,
-            language="es",
-        )
-        return transcript.text
+        if name == "registrar_comida":
+            carbs = args.get("carbs_g")
+            insulin = args.get("insulina_u")
+            desc = args.get("descripcion", "comida")
+            event = "Meal Bolus" if insulin else "Carb Correction"
+            ok = await post_treatment(event, carbs=carbs, insulin=insulin, notes=desc)
+            action = {"tipo": "comida", "desc": desc}
+            return (f"{'ok' if ok else 'error'}: comida registrada (carbs={carbs}, insulina={insulin})", action)
+
+        if name == "registrar_insulina":
+            u = args.get("unidades")
+            tipo = args.get("tipo", "correccion")
+            event = "Temp Basal" if tipo == "basal" else "Correction Bolus"
+            # Para basal usamos una nota clara; NS no modela glargina como basal temp real.
+            if tipo == "basal":
+                ok = await post_treatment("Note", insulin=u, notes=f"Basal Glargina {u}U")
+            else:
+                ok = await post_treatment(event, insulin=u, notes=args.get("nota"))
+            action = {"tipo": "insulina", "u": u, "clase": tipo}
+            return (f"{'ok' if ok else 'error'}: insulina {tipo} {u}U registrada", action)
+
+        if name == "registrar_ejercicio":
+            desc = args.get("descripcion", "ejercicio")
+            dur = args.get("duracion_min")
+            ok = await post_treatment("Exercise", duration=dur, notes=desc)
+            action = {"tipo": "ejercicio", "desc": desc, "dur": dur}
+            return (f"{'ok' if ok else 'error'}: ejercicio registrado ({desc}, {dur}min)", action)
+
+        if name == "registrar_glucosa_capilar":
+            val = args.get("valor")
+            ok = await post_treatment("BG Check", glucose=val, glucoseType="Finger")
+            action = {"tipo": "bgcheck", "valor": val}
+            return (f"{'ok' if ok else 'error'}: glucosa capilar {val} registrada", action)
+
+        if name == "registrar_nota":
+            txt = args.get("texto", "")
+            ok = await post_treatment("Note", notes=txt)
+            action = {"tipo": "nota", "texto": txt}
+            return (f"{'ok' if ok else 'error'}: nota registrada", action)
+
+        if name == "recordar_dato":
+            store.update_profile(chat_id, args.get("clave", "nota"), args.get("valor", ""))
+            action = {"tipo": "memoria"}
+            return ("ok: dato recordado", action)
+
     except Exception as e:
-        logger.error(f"Error transcribiendo audio: {e}")
-        return "[No pude entender el audio, intentá de nuevo]"
+        logger.error(f"_run_tool {name}: {e}")
+        return (f"error ejecutando {name}: {e}", None)
+    return (f"herramienta desconocida: {name}", None)
 
 
-# ─── Visión (fotos de comida → carbohidratos) ───────────────────
-async def analyze_food_image(image_bytes: bytes, caption: str = "") -> str:
-    """Analiza una foto de comida y estima carbohidratos usando visión."""
-    if not groq_client:
-        return "Error: No hay API key de Groq configurada."
-    try:
-        b64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-        user_text = VISION_PROMPT
-        if caption:
-            user_text += f"\n\nEl usuario agregó este comentario: {caption}"
-
-        response = groq_client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64_image}",
-                            },
-                        },
-                    ],
-                }
-            ],
-            max_tokens=4096,
-            temperature=0.3,
-        )
-
-        result = response.choices[0].message.content or ""
-        logger.info(f"Vision raw length={len(result)}, starts_with_think={'<think>' in result[:20]}")
-        result = extract_answer(result)
-        return result if result.strip() else "No pude analizar la imagen. Intentá con otra foto."
-    except Exception as e:
-        logger.error(f"Error analizando imagen: {type(e).__name__}: {e}")
-        return f"Error analizando la imagen: {type(e).__name__}: {e}"
-
-
-# ─── Interacción con Groq (chat) ────────────────────────────────
 async def build_full_context(chat_id: int) -> str:
-    """Construye el contexto completo de Nightscout para el LLM."""
-    # Glucosa actual + historial
-    entry = await get_current_bg()
-    entries = await get_recent_entries(hours=3)
+    """Arma el contexto que ve Claude en cada mensaje."""
+    entry, entries3 = await asyncio.gather(get_current_bg(), get_recent_entries(3))
+    treatments, device_status = await asyncio.gather(get_treatments(6), get_device_status())
 
-    bg_context = ""
+    parts = []
     if entry:
-        bg_context += format_bg_message(entry) + "\n\n"
-    bg_context += summarize_entries(entries)
+        slope = bg_slope(entries3)
+        pred = predict_bg(entry.get("sgv", 0), slope, PREDICT_MIN)
+        bg = format_bg_message(entry)
+        if pred is not None:
+            bg += f"\nProyección ~{PREDICT_MIN}min: ~{pred} mg/dL (tendencia {slope*60:+.0f}/h)"
+        parts.append("[GLUCOSA ACTUAL]\n" + bg)
+    parts.append("[ÚLTIMAS 3H]\n" + summarize_entries(entries3))
 
-    # Treatments recientes
-    treatments = await get_treatments(hours=6)
-    treatments_ctx = format_treatments(treatments) if treatments else ""
+    iob, cob = extract_iob_cob(device_status)
+    if iob is not None or cob is not None:
+        s = []
+        if iob is not None:
+            s.append(f"IOB (insulina activa): {iob:.1f}U")
+        if cob is not None:
+            s.append(f"COB (carbs activos): {cob:.0f}g")
+        parts.append("[INSULINA/CARBS ACTIVOS]\n" + " · ".join(s))
 
-    # IOB / COB
-    device_status = await get_device_status()
-    iob_cob = format_iob_cob(device_status)
+    if treatments:
+        parts.append("[TRATAMIENTOS ÚLTIMAS 6H]\n" + format_treatments(treatments))
 
-    # Registro local del día
-    log_context = get_daily_log_summary(chat_id)
+    profile = store.get_profile(chat_id)
+    if profile:
+        parts.append("[LO QUE SÉ DE VITTORE]\n" +
+                     "\n".join(f"- {k}: {v}" for k, v in profile.items()))
 
-    parts = [f"[GLUCOSA ACTUAL]\n{bg_context}"]
-    if iob_cob:
-        parts.append(f"[INSULINA/CARBS ACTIVOS]\n{iob_cob}")
-    if treatments_ctx:
-        parts.append(f"[TRATAMIENTOS RECIENTES (últimas 6h)]\n{treatments_ctx}")
-    if log_context:
-        parts.append(f"[REGISTROS LOCALES DEL DÍA]\n{log_context}")
+    # Patrones (una vez al día es suficiente, pero lo calculamos liviano aquí).
+    try:
+        days_entries = await get_entries_days(14)
+        patterns = analyze_patterns(days_entries, treatments, 14)
+        digest = format_patterns_digest(patterns, compact=True)
+        if digest:
+            parts.append("[PATRONES RECIENTES]\n" + digest)
+    except Exception as e:
+        logger.error(f"patrones en contexto: {e}")
 
     return "\n\n".join(parts)
 
 
-async def ask_llm(chat_id: int, user_message: str, ns_context: str) -> str:
-    """Envía un mensaje al LLM vía Groq con contexto completo de Nightscout."""
-    if not groq_client:
-        return "Error: No hay API key de Groq configurada."
+def _claude_call(messages: list, tools: Optional[list] = None, system: str = SYSTEM_PROMPT,
+                 max_tokens: int = 900):
+    """Llamada síncrona a Claude (se corre en thread)."""
+    kwargs = dict(model=ANTHROPIC_MODEL, max_tokens=max_tokens, system=system, messages=messages)
+    if tools:
+        kwargs["tools"] = tools
+    return anthropic_client.messages.create(**kwargs)
+
+
+async def ask_llm(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
+    """Chat con Claude usando herramientas. Devuelve (respuesta, acciones_registradas)."""
+    if not anthropic_client:
+        return ("El asistente inteligente no está configurado (falta ANTHROPIC_API_KEY). "
+                "Igual podés usar /glucosa, /resumen, /tratamientos y /patrones.", [])
+
+    history = store.get_history(chat_id, limit=20)
+    messages = list(history)
+    messages.append({"role": "user", "content": f"{ns_context}\n\n[MENSAJE DE VITTORE]\n{user_message}"})
+
+    actions: list[dict] = []
+    final_text = ""
     try:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for _ in range(4):  # hasta 4 vueltas de herramientas
+            resp = await asyncio.to_thread(_claude_call, messages, TOOLS)
+            # Acumular texto
+            text_blocks = [b.text for b in resp.content if b.type == "text"]
+            if text_blocks:
+                final_text = "\n".join(t for t in text_blocks if t).strip()
 
-        for msg in conversation_history[chat_id]:
-            messages.append(msg)
+            if resp.stop_reason != "tool_use":
+                break
 
-        full_context = f"{ns_context}\n\n[MENSAJE DEL USUARIO]\n{user_message}"
-        messages.append({"role": "user", "content": full_context})
+            # Ejecutar herramientas y devolver resultados
+            messages.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for block in resp.content:
+                if block.type == "tool_use":
+                    result, action = await _run_tool(chat_id, block.name, block.input or {})
+                    if action:
+                        actions.append(action)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            messages.append({"role": "user", "content": tool_results})
 
-        response = groq_client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7,
-        )
+        if not final_text:
+            final_text = "Listo. ✅" if actions else "No estoy seguro de qué necesitás. ¿Me lo repetís?"
 
-        reply = extract_answer(response.choices[0].message.content or "")
-
-        add_to_history(chat_id, "user", user_message)
-        add_to_history(chat_id, "assistant", reply)
-        await detect_and_log(chat_id, user_message)
-
-        return reply
+        store.add_history(chat_id, "user", user_message)
+        store.add_history(chat_id, "assistant", final_text)
+        return final_text, actions
     except Exception as e:
-        logger.error(f"Error con Groq LLM: {type(e).__name__}: {e}")
-        return f"Error con el asistente: {type(e).__name__}: {e}"
+        logger.error(f"ask_llm: {type(e).__name__}: {e}")
+        return (f"Tuve un problema para pensar la respuesta ({type(e).__name__}). Probá de nuevo en un momento.", actions)
 
 
-async def detect_and_log(chat_id: int, message: str):
-    """Detecta registros en el mensaje, los guarda localmente y en Nightscout."""
-    msg = message.lower()
+# ─── Visión: foto de comida → carbohidratos (Claude) ─────────────
+async def analyze_food_image(image_bytes: bytes, caption: str = "") -> tuple[str, Optional[float]]:
+    """Devuelve (texto_para_usuario, carbs_estimados)."""
+    if not anthropic_client:
+        return ("No puedo analizar fotos sin ANTHROPIC_API_KEY configurada.", None)
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        "Analizá esta foto de comida para una persona con diabetes tipo 1. "
+        "Estimá los carbohidratos totales. Respondé SOLO un JSON válido con esta forma:\n"
+        '{"descripcion": "qué ves, breve", "carbs_g": <número>, "confianza": "alta|media|baja", '
+        '"comentario": "1 frase útil, aclarando que es estimación"}\n'
+        "Nunca sugieras dosis de insulina."
+    )
+    if caption:
+        prompt += f"\nComentario del usuario: {caption}"
+    try:
+        resp = await asyncio.to_thread(
+            _claude_call,
+            [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+            None,  # sin tools
+            "Sos un asistente nutricional preciso para diabetes tipo 1. Respondés solo JSON.",
+            600,
+        )
+        raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+        # Extraer el JSON aunque venga con texto alrededor
+        start, end = raw.find("{"), raw.rfind("}")
+        data = json.loads(raw[start:end + 1]) if start >= 0 else {}
+        desc = data.get("descripcion", "comida")
+        carbs = data.get("carbs_g")
+        conf = data.get("confianza", "media")
+        comentario = data.get("comentario", "Es una estimación; puede variar según la porción real.")
+        texto = (f"🍽 {desc}\n"
+                 f"🍞 Carbs estimados: ~{carbs}g (confianza {conf})\n"
+                 f"ℹ️ {comentario}")
+        return texto, (float(carbs) if isinstance(carbs, (int, float)) else None)
+    except Exception as e:
+        logger.error(f"analyze_food_image: {type(e).__name__}: {e}")
+        return ("No pude analizar bien la foto. Probá con más luz o incluí un cubierto de referencia.", None)
 
-    if any(w in msg for w in ["comí", "almorcé", "cené", "desayuné", "meriendé", "comimos", "comió", "tomé jugo", "comida"]):
-        add_to_daily_log(chat_id, "comida", message)
-        await post_treatment("Meal Bolus", notes=message)
 
-    elif any(w in msg for w in ["insulina", "apidra", "glargina", "lantus", "toujeo", "me puse", "unidades", "me inyecté"]):
-        add_to_daily_log(chat_id, "insulina", message)
-        # Extraer unidades del mensaje si es posible
-        units = None
-        import re as _re
-        match = _re.search(r"(\d+(?:[.,]\d+)?)\s*(?:u(?:nidades)?|de apidra|de glargina|de lantus|de toujeo)", msg)
-        if match:
-            units = float(match.group(1).replace(",", "."))
-        kwargs = {"notes": message}
-        if units:
-            kwargs["insulin"] = units
-        await post_treatment("Correction Bolus", **kwargs)
-
-    elif any(w in msg for w in ["corrí", "caminé", "ejercicio", "fútbol", "natación", "bici", "gimnasio", "deporte"]):
-        add_to_daily_log(chat_id, "ejercicio", message)
-        await post_treatment("Exercise", notes=message)
-
-    elif any(w in msg for w in ["nota:", "recordar:", "turno", "cita", "médico", "endocrinólogo"]):
-        add_to_daily_log(chat_id, "nota", message)
-        await post_treatment("Note", notes=message)
+# ─── Audio (Whisper de Groq) ─────────────────────────────────────
+async def transcribe_voice(file_bytes: bytes) -> str:
+    if not groq_client:
+        return "[No hay transcripción de audio configurada (falta GROQ_API_KEY)]"
+    try:
+        def _call():
+            audio_file = io.BytesIO(file_bytes)
+            audio_file.name = "voice.ogg"
+            return groq_client.audio.transcriptions.create(
+                model="whisper-large-v3", file=audio_file, language="es",
+            )
+        transcript = await asyncio.to_thread(_call)
+        return transcript.text
+    except Exception as e:
+        logger.error(f"transcribe_voice: {e}")
+        return "[No pude entender el audio, intentá de nuevo]"
 
 
 # ─── Handlers de Telegram ────────────────────────────────────────
 def is_authorized(update: Update) -> bool:
-    if not ALLOWED_USERS or ALLOWED_USERS == [""]:
+    if not ALLOWED_USERS:
         return True
     return str(update.effective_chat.id) in ALLOWED_USERS
 
@@ -606,18 +877,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("No tenés autorización para usar este bot.")
         return
-
     await update.message.reply_text(
-        "¡Hola! Soy el asistente de glucosa de Vittore 🩺\n\n"
+        "¡Hola! Soy VittoBot, tu asistente de glucosa 🩺\n\n"
         "Podés:\n"
-        "• /glucosa — Ver la lectura actual\n"
-        "• /resumen — Resumen de las últimas 3 horas\n"
-        "• /tratamientos — Insulina y carbs de las últimas 6h\n"
-        "• /registro — Ver los registros de hoy\n"
-        "• Escribirme o mandarme un audio con cualquier pregunta\n"
-        "• Mandarme una foto de comida para estimar carbohidratos 📸\n"
-        "• Decirme qué comió, cuánta insulina se puso, si hizo ejercicio\n\n"
-        f"Tu chat ID es: {update.effective_chat.id}"
+        "• /glucosa — lectura actual\n"
+        "• /resumen — últimas 3 horas\n"
+        "• /tratamientos — insulina y carbs (6h)\n"
+        "• /registro — lo de hoy\n"
+        "• /patrones — patrones de los últimos 14 días\n"
+        "• Escribirme, mandarme audio o una foto de comida 📸\n"
+        "• Contarme qué comiste, qué insulina te pusiste o si entrenaste\n\n"
+        f"Tu chat ID: {update.effective_chat.id}"
     )
 
 
@@ -625,8 +895,14 @@ async def cmd_glucosa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     entry = await get_current_bg()
+    entries = await get_recent_entries(1)
     if entry:
-        await update.message.reply_text(format_bg_message(entry), parse_mode="Markdown")
+        msg = format_bg_message(entry)
+        slope = bg_slope(entries)
+        pred = predict_bg(entry.get("sgv", 0), slope, PREDICT_MIN)
+        if pred is not None:
+            msg += f"\nEn ~{PREDICT_MIN}min podría estar cerca de {pred} mg/dL."
+        await update.message.reply_text(msg)
     else:
         await update.message.reply_text("No pude obtener datos de Nightscout.")
 
@@ -634,160 +910,283 @@ async def cmd_glucosa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    entries = await get_recent_entries(hours=3)
-    summary = summarize_entries(entries)
-    await update.message.reply_text(summary)
-
-
-async def cmd_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    summary = get_daily_log_summary(update.effective_chat.id)
-    await update.message.reply_text(summary)
+    entries = await get_recent_entries(3)
+    await update.message.reply_text(summarize_entries(entries))
 
 
 async def cmd_tratamientos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra los tratamientos recientes de Nightscout."""
     if not is_authorized(update):
         return
-    treatments = await get_treatments(hours=6)
-    text = format_treatments(treatments)
-    # Agregar IOB/COB si están disponibles
-    device_status = await get_device_status()
-    iob_cob = format_iob_cob(device_status)
-    if iob_cob:
-        text += f"\n\n⚡ {iob_cob}"
+    treatments = await get_treatments(6)
+    text = "💉🍞 Tratamientos (6h):\n" + format_treatments(treatments)
+    iob, cob = extract_iob_cob(await get_device_status())
+    extra = []
+    if iob is not None:
+        extra.append(f"IOB {iob:.1f}U")
+    if cob is not None:
+        extra.append(f"COB {cob:.0f}g")
+    if extra:
+        text += "\n\n⚡ " + " · ".join(extra)
     await update.message.reply_text(text)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja mensajes de texto libres."""
+async def cmd_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registros de hoy, leídos de Nightscout (sobreviven reinicios)."""
     if not is_authorized(update):
         return
+    treatments = await get_treatments(24)
+    today = datetime.now(TZ_AR).strftime("%Y-%m-%d")
+    todays = []
+    for t in treatments:
+        created = t.get("created_at", "")
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(TZ_AR)
+            if dt.strftime("%Y-%m-%d") == today:
+                todays.append(t)
+        except Exception:
+            continue
+    if not todays:
+        await update.message.reply_text("No hay registros de hoy todavía.")
+        return
+    await update.message.reply_text(f"📋 Hoy ({today}):\n" + format_treatments(todays))
 
-    user_text = update.message.text
+
+async def cmd_patrones(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     await update.message.chat.send_action("typing")
+    entries = await get_entries_days(14)
+    treatments = await get_treatments(24 * 14)
+    p = analyze_patterns(entries, treatments, 14)
+    digest = format_patterns_digest(p, compact=False)
+    # Que Claude lo narre para la consulta con el endocrinólogo, si está disponible.
+    if anthropic_client and p["daily"]:
+        try:
+            resp = await asyncio.to_thread(
+                _claude_call,
+                [{"role": "user", "content":
+                    "Estos son los patrones de glucosa de Vittore (14 días). Escribí un resumen "
+                    "breve y claro (máx 10 líneas, español argentino, sin tablas) para que el papá "
+                    "lo comente con el endocrinólogo. Destacá riesgos (hipos nocturnas, ejercicio) "
+                    "y lo que mejoró. NO sugieras dosis.\n\n" + digest}],
+                None, SYSTEM_PROMPT, 500,
+            )
+            narr = "".join(b.text for b in resp.content if b.type == "text").strip()
+            await update.message.reply_text(narr or digest)
+            return
+        except Exception as e:
+            logger.error(f"cmd_patrones narrativa: {e}")
+    await update.message.reply_text(digest)
 
-    ns_context = await build_full_context(update.effective_chat.id)
-    response = await ask_llm(update.effective_chat.id, user_text, ns_context)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    chat_id = update.effective_chat.id
+    await update.message.chat.send_action("typing")
+    ns_context = await build_full_context(chat_id)
+    response, actions = await ask_llm(chat_id, update.message.text, ns_context)
     await update.message.reply_text(response)
+    _schedule_followups(context, chat_id, actions)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja mensajes de voz: transcribe y procesa como texto."""
     if not is_authorized(update):
         return
-
-    if not groq_client:
-        await update.message.reply_text(
-            "El asistente no está habilitado. "
-            "Necesito una API key de Groq (variable GROQ_API_KEY)."
-        )
-        return
-
+    chat_id = update.effective_chat.id
     await update.message.chat.send_action("typing")
-
     voice = update.message.voice or update.message.audio
     file = await context.bot.get_file(voice.file_id)
     file_bytes = await file.download_as_bytearray()
-
     text = await transcribe_voice(bytes(file_bytes))
     if text.startswith("["):
         await update.message.reply_text(text)
         return
-
     await update.message.reply_text(f"🎙 Entendí: _{text}_", parse_mode="Markdown")
-
-    ns_context = await build_full_context(update.effective_chat.id)
-    response = await ask_llm(update.effective_chat.id, text, ns_context)
+    ns_context = await build_full_context(chat_id)
+    response, actions = await ask_llm(chat_id, text, ns_context)
     await update.message.reply_text(response)
+    _schedule_followups(context, chat_id, actions)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja fotos: analiza comida y estima carbohidratos."""
     if not is_authorized(update):
         return
-
-    if not groq_client:
-        await update.message.reply_text("El asistente no está habilitado.")
-        return
-
+    chat_id = update.effective_chat.id
     await update.message.chat.send_action("typing")
-
-    # Tomar la foto de mayor resolución
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     file_bytes = await file.download_as_bytearray()
-
-    # Caption opcional del usuario
     caption = update.message.caption or ""
-
-    # Analizar con visión
-    response = await analyze_food_image(bytes(file_bytes), caption)
-
-    # Registrar como comida
-    food_desc = caption if caption else "Foto de comida analizada"
-    add_to_daily_log(update.effective_chat.id, "comida", food_desc)
-    add_to_history(update.effective_chat.id, "user", f"[Envió foto de comida] {caption}")
-    add_to_history(update.effective_chat.id, "assistant", response)
-
-    await update.message.reply_text(f"📸 Análisis nutricional:\n\n{response}")
+    texto, carbs = await analyze_food_image(bytes(file_bytes), caption)
+    # Registrar la comida en Nightscout con los carbs estimados
+    desc = caption or "Comida (foto)"
+    await post_treatment("Carb Correction", carbs=carbs, notes=f"{desc} [estimado por foto]")
+    store.add_history(chat_id, "user", f"[Foto de comida] {caption}")
+    store.add_history(chat_id, "assistant", texto)
+    await update.message.reply_text(f"📸 {texto}\n\n✅ Registrado en Nightscout.")
 
 
-# ─── Alertas automáticas ─────────────────────────────────────────
+def _schedule_followups(context: ContextTypes.DEFAULT_TYPE, chat_id: int, actions: list[dict]):
+    """Programa recordatorios proactivos según lo que se registró."""
+    if not context.job_queue:
+        return
+    for a in actions:
+        if a.get("tipo") == "ejercicio":
+            # Recordatorio de medir ~45 min después del ejercicio.
+            context.job_queue.run_once(
+                _post_exercise_nudge, when=45 * 60,
+                data={"chat_id": chat_id, "desc": a.get("desc", "el entrenamiento")},
+                name=f"nudge_ex_{chat_id}",
+            )
+
+
+async def _post_exercise_nudge(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    chat_id = data["chat_id"]
+    entry = await get_current_bg()
+    extra = f"\n{format_bg_message(entry)}" if entry else ""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(f"🏒 ¿Cómo venís después de {data['desc']}? Acordate de medir.{extra}\n"
+              "Ojo con las bajas en las horas siguientes y de madrugada."),
+    )
+
+
+# ─── Alertas inteligentes (anti-spam + predictivas) ──────────────
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
     entry = await get_current_bg()
+    now = datetime.now(timezone.utc)
+    state = store.get_alert_state()
+    last_level = state.get("level")
+    last_ts = state.get("ts")
+    if isinstance(last_ts, str):
+        try:
+            last_ts = datetime.fromisoformat(last_ts)
+        except Exception:
+            last_ts = None
+
+    # 1) Sensor caído / sin datos
     if not entry:
+        if last_level != "no_data":
+            _broadcast(context, "📡 No estoy recibiendo datos del sensor. Revisá el FreeStyle / LibreLinkUp.")
+            store.set_alert_state({"level": "no_data", "ts": now.isoformat()})
         return
 
     sgv = entry.get("sgv", 0)
-    alert_msg = None
+    date_ms = entry.get("date", 0)
+    age_min = (now - datetime.fromtimestamp(date_ms / 1000, tz=timezone.utc)).total_seconds() / 60
+    if age_min > SENSOR_GAP_MIN:
+        if last_level != "no_data":
+            _broadcast(context, f"📡 Última lectura hace {int(age_min)} min. El sensor puede estar caído.")
+            store.set_alert_state({"level": "no_data", "ts": now.isoformat()})
+        return
 
-    if sgv <= BG_URGENT_LOW:
-        alert_msg = f"🚨 HIPOGLUCEMIA URGENTE 🚨\n\n{format_bg_message(entry)}\n\n¡Vittore necesita azúcar AHORA!"
-    elif sgv <= BG_LOW:
-        alert_msg = f"⚠️ Glucosa baja\n\n{format_bg_message(entry)}\n\nConsiderá dar carbohidratos."
-    elif sgv >= BG_URGENT_HIGH:
-        alert_msg = f"🚨 HIPERGLUCEMIA URGENTE 🚨\n\n{format_bg_message(entry)}\n\nConsultá con el endocrinólogo si persiste."
-    elif sgv >= BG_HIGH:
-        alert_msg = f"⚠️ Glucosa alta\n\n{format_bg_message(entry)}"
+    level = classify_bg(sgv)
+    entries = await get_recent_entries(1)
+    slope = bg_slope(entries)
+    iob, _ = extract_iob_cob(await get_device_status())
 
-    if alert_msg and ALLOWED_USERS and ALLOWED_USERS != [""]:
-        for chat_id in ALLOWED_USERS:
-            try:
-                await context.bot.send_message(
-                    chat_id=int(chat_id.strip()),
-                    text=alert_msg,
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logger.error(f"Error enviando alerta a {chat_id}: {e}")
+    # 2) Aviso predictivo: en rango pero bajando hacia hipoglucemia
+    predicted = predict_bg(sgv, slope, PREDICT_MIN)
+    predictive = (
+        level == "in_range" and slope is not None and slope < -1.0
+        and predicted is not None and predicted <= BG_LOW
+    )
+
+    order = {"urgent_low": 0, "low": 1, "in_range": 2, "high": 3, "urgent_high": 4, "predicted_low": 1}
+    effective = "predicted_low" if predictive and level == "in_range" else level
+
+    # ¿Corresponde avisar?
+    should = False
+    if effective != last_level:
+        # Cambio de estado. Avisamos si es un estado "malo", o si se RECUPERÓ a rango.
+        if effective in ("urgent_low", "low", "urgent_high", "high", "predicted_low"):
+            should = True
+        elif effective == "in_range" and last_level in ("urgent_low", "low", "urgent_high", "high", "predicted_low"):
+            _broadcast(context, f"✅ Glucosa de nuevo en rango: {sgv} mg/dL. Buen manejo.")
+            store.set_alert_state({"level": "in_range", "ts": now.isoformat()})
+            return
+    else:
+        # Mismo estado malo: re-avisar solo tras el cooldown.
+        if effective in ("urgent_low", "urgent_high") and last_ts:
+            if (now - last_ts).total_seconds() / 60 >= ALERT_COOLDOWN_MIN:
+                should = True
+
+    if not should:
+        # Igual actualizamos el nivel base (sin re-notificar) para no perder transiciones.
+        if effective == "in_range":
+            store.set_alert_state({"level": "in_range", "ts": now.isoformat()})
+        return
+
+    msg = _build_alert_message(entry, effective, slope, iob)
+    _broadcast(context, msg)
+    store.set_alert_state({"level": effective, "ts": now.isoformat()})
+
+
+def _build_alert_message(entry: dict, level: str, slope: Optional[float], iob: Optional[float]) -> str:
+    base = format_bg_message(entry)
+    iob_txt = f"\n💉 Insulina activa: {iob:.1f}U" if iob else ""
+    if level == "urgent_low":
+        return f"🚨 HIPOGLUCEMIA URGENTE 🚨\n{base}{iob_txt}\n¡Vittore necesita azúcar rápido AHORA! Medir de nuevo en 15 min."
+    if level == "predicted_low":
+        return f"⚠️ Ojo: viene bajando y podría entrar en hipoglucemia pronto.\n{base}{iob_txt}\nConsiderá un colación/azúcar rápido y volvé a medir."
+    if level == "low":
+        return f"🟡 Glucosa baja.\n{base}{iob_txt}\nConsiderá carbohidratos rápidos y medir en 15 min."
+    if level == "urgent_high":
+        return f"🚨 Glucosa muy alta.\n{base}{iob_txt}\nSi persiste, seguí las pautas del endocrinólogo. Ojo con cetonas."
+    if level == "high":
+        return f"🟠 Glucosa alta.\n{base}{iob_txt}"
+    return base
+
+
+def _broadcast(context: ContextTypes.DEFAULT_TYPE, text: str):
+    for chat_id in CAREGIVER_CHAT_IDS:
+        try:
+            context.application.create_task(
+                context.bot.send_message(chat_id=int(chat_id), text=text)
+            )
+        except Exception as e:
+            logger.error(f"broadcast a {chat_id}: {e}")
+
+
+# ─── Resumen diario proactivo ────────────────────────────────────
+async def daily_evening_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Cada noche: resumen del día + aviso de riesgo nocturno si hubo ejercicio."""
+    entries = await get_recent_entries(24)
+    treatments = await get_treatments(24)
+    summary = summarize_entries(entries)
+    ex_today = [t for t in treatments if t.get("eventType") == "Exercise"]
+    warn = ""
+    if ex_today:
+        warn = ("\n🌙 Hoy hubo entrenamiento: ojo con las bajas de madrugada. "
+                "Puede convenir medir antes de dormir.")
+    _broadcast(context, f"🌆 Resumen del día:\n{summary}{warn}")
 
 
 # ─── Main ────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("glucosa", cmd_glucosa))
     app.add_handler(CommandHandler("resumen", cmd_resumen))
-    app.add_handler(CommandHandler("registro", cmd_registro))
     app.add_handler(CommandHandler("tratamientos", cmd_tratamientos))
+    app.add_handler(CommandHandler("registro", cmd_registro))
+    app.add_handler(CommandHandler("patrones", cmd_patrones))
 
-    # Mensajes de texto → LLM vía Groq
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Mensajes de voz → Whisper → LLM vía Groq
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-
-    # Fotos → Visión (estimación de carbohidratos)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Alertas cada 5 minutos
-    app.job_queue.run_repeating(check_alerts, interval=300, first=10)
+    # Alertas cada 5 minutos (ahora con anti-spam y predicción)
+    app.job_queue.run_repeating(check_alerts, interval=300, first=15)
+    # Resumen diario a las 22:30 hora Argentina
+    app.job_queue.run_daily(daily_evening_summary, time=dtime(22, 30, tzinfo=TZ_AR))
 
-    logger.info("VittoreD1Bot v4 iniciado ✓ (carga completa NS)")
+    brain = f"Claude ({ANTHROPIC_MODEL})" if anthropic_client else "SIN cerebro (falta ANTHROPIC_API_KEY)"
+    persist = "MongoDB" if store.db is not None else "RAM"
+    logger.info(f"VittoreD1Bot v5 iniciado ✓ | cerebro: {brain} | persistencia: {persist}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
