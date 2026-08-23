@@ -1413,35 +1413,46 @@ def _short_treatment(t: dict) -> str:
 
 
 async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista tratamientos numerados; /borrar N marca uno para borrar (solo admin)."""
+    """Lista tratamientos numerados; /borrar N [M ...] marca para borrar (solo admin)."""
     if not is_admin(update):
         await update.message.reply_text("Solo un administrador puede borrar registros.")
         return
     chat_id = update.effective_chat.id
     args = context.args or []
+    nums = [int(a) for a in args if a.isdigit()]
 
-    # /borrar N  → preparar confirmación
-    if args and args[0].isdigit():
-        n = int(args[0])
+    # /borrar N [M ...]  → preparar confirmación (uno o varios)
+    if nums:
         items = _delete_index.get(chat_id, [])
-        if not (1 <= n <= len(items)):
-            await update.message.reply_text("Número inválido. Mandá /borrar (sin número) para ver la lista.")
+        if not items:
+            await update.message.reply_text("Primero mandá /borrar (sin número) para ver la lista actualizada.")
             return
-        t = items[n - 1]
-        _delete_pending[chat_id] = t
-        await update.message.reply_text(
-            f"⚠️ Vas a borrar:\n{_short_treatment(t)}\n\n"
-            "Mandá /confirmar para borrarlo, o /cancelar para dejarlo."
-        )
+        chosen, malos = [], []
+        for n in nums:
+            if 1 <= n <= len(items):
+                chosen.append(items[n - 1])
+            else:
+                malos.append(str(n))
+        if not chosen:
+            await update.message.reply_text("Número(s) inválido(s). Mandá /borrar para ver la lista.")
+            return
+        _delete_pending[chat_id] = chosen
+        lines = ["⚠️ Vas a borrar:"]
+        lines += [f"  • {_short_treatment(t)}" for t in chosen]
+        if malos:
+            lines.append(f"(ignoro números fuera de rango: {', '.join(malos)})")
+        lines.append("\nMandá /confirmar para borrar, o /cancelar para dejar.")
+        await update.message.reply_text("\n".join(lines))
         return
 
-    # /borrar  → mostrar lista numerada
+    # /borrar (o con texto que no es número) → mostrar lista numerada
     treatments = await get_treatments(24)
     if not treatments:
         await update.message.reply_text("No hay tratamientos recientes para borrar.")
         return
     _delete_index[chat_id] = treatments
-    lines = ["🗑 Tratamientos (últimas 24h). Mandá /borrar N para elegir:\n"]
+    _delete_pending.pop(chat_id, None)
+    lines = ["🗑 Tratamientos (últimas 24h). Elegí por número, ej: /borrar 2  (o varios: /borrar 2 3 4)\n"]
     for i, t in enumerate(treatments, 1):
         lines.append(f"{i}. {_short_treatment(t)}")
     await update.message.reply_text("\n".join(lines))
@@ -1451,17 +1462,25 @@ async def cmd_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     chat_id = update.effective_chat.id
-    t = _delete_pending.get(chat_id)
-    if not t:
+    chosen = _delete_pending.get(chat_id)
+    if not chosen:
         await update.message.reply_text("No hay nada pendiente de borrar. Usá /borrar primero.")
         return
-    _id = t.get("_id")
-    ok = await delete_treatment(_id) if _id else False
+    ok, fallos = [], []
+    for t in chosen:
+        _id = t.get("_id")
+        if _id and await delete_treatment(_id):
+            ok.append(t)
+        else:
+            fallos.append(t)
     _delete_pending.pop(chat_id, None)
+    _delete_index.pop(chat_id, None)  # los números quedan desactualizados tras borrar
+    msg = ""
     if ok:
-        await update.message.reply_text(f"✅ Borrado:\n{_short_treatment(t)}")
-    else:
-        await update.message.reply_text("❌ No pude borrarlo. Fijate en los logs o probá de nuevo.")
+        msg += "✅ Borrado(s):\n" + "\n".join(f"  • {_short_treatment(t)}" for t in ok)
+    if fallos:
+        msg += ("\n❌ No pude borrar:\n" + "\n".join(f"  • {_short_treatment(t)}" for t in fallos))
+    await update.message.reply_text(msg or "No se borró nada.")
 
 
 async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
