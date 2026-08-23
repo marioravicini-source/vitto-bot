@@ -781,16 +781,19 @@ NUNCA calcules, sugieras ni recomiendes dosis de insulina. NUNCA digas "ponete X
 
 RANGOS: en rango {BG_LOW}-{BG_HIGH} · bajo <{BG_LOW} · alto >{BG_HIGH} · urgente bajo ≤{BG_URGENT_LOW} · urgente alto ≥{BG_URGENT_HIGH}.
 
-CÓMO PENSAR (esto es lo que te hace útil, no un tablero):
-- Correlacioná: relacioná glucosa con comidas, insulina activa (IOB) y ejercicio del contexto. Ej: "venís bajando y todavía tenés insulina activa de la corrección de las 17:28, ojo".
+SEGUÍ EL HILO (muy importante):
+- Respondé a lo ÚLTIMO que te dijeron. Si te están contestando algo que VOS preguntaste (ej. vos preguntaste "¿cuál?" y responden "la corrección"), continuá ESE tema; no cambies de tema por tu cuenta.
+- Los datos de glucosa/predicción del contexto son INFORMACIÓN DE FONDO para que respondas con criterio. NO empieces cada mensaje hablando de la glucosa ni la repitas si no viene al caso. Comentala solo si te preguntan o si es directamente relevante a lo que están hablando.
+- Para BORRAR o corregir un registro ya cargado, se usa el comando /borrar. NO ofrezcas "marcarlo como ignorar" ni digas que podés borrar por chat: si quieren borrar, decíles que usen /borrar.
+
+CÓMO PENSAR (cuando el tema ES la glucosa):
+- Correlacioná: relacioná glucosa con comidas, insulina activa (IOB) y ejercicio del contexto.
 - Anticipá: si la tendencia va hacia una baja o suba, decilo antes de que pase.
-- Usá los PATRONES del contexto (hipos nocturnas post-hockey, picos post-comida) para dar avisos concretos y con memoria.
+- Usá los PATRONES del contexto (hipos nocturnas post-hockey, picos post-comida) para avisos concretos.
 - Cerrá con UNA observación útil, no con frases genéricas ("todo bien, avisame").
 
-REGISTRAR (usá las herramientas, no lo hagas a mano):
-Cuando Vittore cuente que comió, se aplicó insulina, hizo ejercicio, midió su glucosa capilar, o quiera dejar una nota/turno, LLAMÁ a la herramienta correspondiente con los datos que puedas extraer (gramos de carbohidratos si los sabés, unidades de insulina, minutos de ejercicio). Si falta un dato importante y es fácil, preguntá en una línea; si no, registrá con lo que hay. Después confirmá en 1 línea: "✅ Registrado: 🍽 Pasta (~60g)".
-
-MEMORIA: si aprendés algo estable y útil (comida habitual, horario de entrenamiento, cómo prefiere que le hablen, su apodo para vos), guardalo con recordar_dato.
+REGISTRAR:
+Cuando Vittore cuente que comió, se aplicó insulina, hizo ejercicio, midió su glucosa capilar, o quiera dejar una nota, se registra automáticamente en su seguimiento. Confirmá en 1 línea, natural (ej. "Anotado 🍽 pasta ~60g"). Si falta un dato importante y es fácil, preguntá en una línea. NUNCA sugieras cuánta insulina ponerse.
 
 FORMATO TELEGRAM:
 - Nada de tablas markdown (Telegram no las renderiza). Usá texto plano y emojis como separadores.
@@ -1016,6 +1019,100 @@ def _groq_call(messages: list, tools: Optional[list] = None, model: Optional[str
     return groq_client.chat.completions.create(**kwargs)
 
 
+# ─── Registro por extracción JSON (para modelos sin tool-calling, ej. gpt-oss) ─
+_EXTRACT_SYSTEM = "Sos un extractor de datos de diabetes. Respondés SOLO JSON válido, sin texto alrededor."
+
+
+def _extract_prompt(last_bot: str, user_msg: str) -> str:
+    return (
+        "Detectá si en el mensaje de Vittore hay algo para REGISTRAR en su "
+        "seguimiento: una comida, una dosis de insulina que YA se aplicó, ejercicio, "
+        "una medición de glucosa capilar, o una nota. Usá el contexto: si el bot "
+        "preguntó 'cuántas unidades' y Vittore responde un número, es una insulina.\n"
+        "Respondé SOLO este JSON (sin explicación):\n"
+        '{"acciones": [{"tipo": "comida|insulina|ejercicio|glucosa|nota", '
+        '"descripcion": "", "carbs_g": null, "insulina_u": null, "unidades": null, '
+        '"clase": "correccion|basal", "duracion_min": null, "valor": null, "texto": ""}]}\n'
+        "Reglas: NO inventes datos que no dijo. Insulina solo si hay UNIDADES. "
+        "Glucosa capilar solo si hay un VALOR numérico. Si no hay nada concreto para "
+        'registrar, devolvé {"acciones": []}.\n\n'
+        f"[BOT PREGUNTÓ/DIJO]: {last_bot[:300]}\n[VITTORE DIJO]: {user_msg}"
+    )
+
+
+def _map_extracted_action(a: dict) -> Optional[tuple]:
+    """Convierte una acción del JSON al par (nombre_herramienta, args) de _run_tool."""
+    tipo = (a.get("tipo") or "").lower()
+    if tipo == "comida":
+        return ("registrar_comida", {
+            "descripcion": a.get("descripcion") or "comida",
+            "carbs_g": a.get("carbs_g"), "insulina_u": a.get("insulina_u")})
+    if tipo == "insulina":
+        u = a.get("unidades") or a.get("insulina_u")
+        if not u:
+            return None
+        return ("registrar_insulina", {
+            "unidades": u, "tipo": a.get("clase") or "correccion", "nota": a.get("texto")})
+    if tipo == "ejercicio":
+        return ("registrar_ejercicio", {
+            "descripcion": a.get("descripcion") or "ejercicio", "duracion_min": a.get("duracion_min")})
+    if tipo == "glucosa":
+        if not a.get("valor"):
+            return None
+        return ("registrar_glucosa_capilar", {"valor": a.get("valor")})
+    if tipo == "nota":
+        txt = a.get("texto") or a.get("descripcion")
+        if not txt:
+            return None
+        return ("registrar_nota", {"texto": txt})
+    return None
+
+
+def _describe_logged(actions: list[dict]) -> str:
+    partes = []
+    for a in actions:
+        t = a.get("tipo")
+        if t == "comida":
+            partes.append(f"🍽 {a.get('desc', 'comida')}")
+        elif t == "insulina":
+            partes.append(f"💉 {a.get('u', '?')}U ({a.get('clase', 'correccion')})")
+        elif t == "ejercicio":
+            partes.append(f"🏃 {a.get('desc', 'ejercicio')}")
+        elif t == "bgcheck":
+            partes.append(f"🩸 {a.get('valor', '?')}")
+        elif t == "nota":
+            partes.append("📝 nota")
+    return " · ".join(partes) if partes else "registro"
+
+
+async def extract_and_log(chat_id: int, last_bot: str, user_message: str) -> list[dict]:
+    """Extrae registros del mensaje con un llamado JSON (sin tool-calling) y los guarda."""
+    if not groq_client:
+        return []
+    try:
+        resp = await asyncio.to_thread(
+            _groq_call,
+            [{"role": "system", "content": _EXTRACT_SYSTEM},
+             {"role": "user", "content": _extract_prompt(last_bot, user_message)}],
+            None, None, 400, 0.0)
+        raw = extract_answer(resp.choices[0].message.content or "")
+        s, e = raw.find("{"), raw.rfind("}")
+        data = json.loads(raw[s:e + 1]) if (s >= 0 and e > s) else {}
+    except Exception as ex:
+        logger.error(f"extract_and_log: {type(ex).__name__}: {ex}")
+        return []
+    actions = []
+    for a in (data.get("acciones") or [])[:4]:
+        mapped = _map_extracted_action(a)
+        if not mapped:
+            continue
+        name, args = mapped
+        _, action = await _run_tool(chat_id, name, args)
+        if action:
+            actions.append(action)
+    return actions
+
+
 async def ask_llm(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
     """Chat con herramientas. Enruta al proveedor configurado (Groq gratis o Claude)."""
     provider = brain_provider()
@@ -1105,6 +1202,15 @@ async def _ask_groq(chat_id: int, user_message: str, ns_context: str) -> tuple[s
                         actions.append(action)
                     messages.append({"role": "tool", "tool_call_id": tc.id,
                                      "name": tc.function.name, "content": result})
+            # Si el modelo no registró nada por herramientas, intentar por extracción JSON
+            # (necesario con gpt-oss, que tiene el tool-calling roto).
+            if not actions:
+                last_bot = next(
+                    (m["content"] for m in reversed(history) if m.get("role") == "assistant"), "")
+                logged = await extract_and_log(chat_id, last_bot, user_message)
+                if logged:
+                    actions = logged
+                    final_text = (f"{final_text}\n\n✅ Anotado: {_describe_logged(logged)}").strip()
             if not final_text:
                 final_text = "Listo. ✅" if actions else "No estoy seguro de qué necesitás. ¿Me lo repetís?"
             store.add_history(chat_id, "user", user_message)
