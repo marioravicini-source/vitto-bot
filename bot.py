@@ -807,13 +807,18 @@ Sos acompañamiento, no reemplazás al médico ni a la familia. Las estimaciones
 TOOLS = [
     {
         "name": "registrar_comida",
-        "description": "Registra una comida/colación en Nightscout. Usar cuando el usuario cuenta que comió algo.",
+        "description": "Registra una comida/colación en Nightscout. Usar cuando el usuario cuenta que comió algo. Elegí el tipo_evento correcto según el contexto.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "descripcion": {"type": "string", "description": "Qué comió, breve."},
                 "carbs_g": {"type": "number", "description": "Carbohidratos estimados en gramos, si se pueden inferir."},
                 "insulina_u": {"type": "number", "description": "Unidades de insulina que se aplicó junto a la comida, si las mencionó."},
+                "tipo_evento": {
+                    "type": "string",
+                    "enum": ["comida", "colacion", "correccion_baja"],
+                    "description": "comida = almuerzo/cena/desayuno (Meal Bolus). colacion = snack/merienda (Snack Bolus). correccion_baja = carbos para remontar una hipoglucemia (Carb Correction). Si no es claro, usar 'comida'.",
+                },
             },
             "required": ["descripcion"],
         },
@@ -884,10 +889,18 @@ async def _run_tool(chat_id: int, name: str, args: dict) -> tuple[str, Optional[
             carbs = args.get("carbs_g")
             insulin = args.get("insulina_u")
             desc = args.get("descripcion", "comida")
-            event = "Meal Bolus" if insulin else "Carb Correction"
+            tipo_ev = args.get("tipo_evento", "comida")
+            # Mapear al eventType correcto de Nightscout
+            if tipo_ev == "correccion_baja":
+                event = "Carb Correction"
+            elif tipo_ev == "colacion":
+                event = "Snack Bolus"
+            else:
+                # comida principal (almuerzo, cena, desayuno)
+                event = "Meal Bolus"
             ok = await post_treatment(event, carbs=carbs, insulin=insulin, notes=desc)
-            action = {"tipo": "comida", "desc": desc}
-            return (f"{'ok' if ok else 'error'}: comida registrada (carbs={carbs}, insulina={insulin})", action)
+            action = {"tipo": "comida", "desc": desc, "evento_ns": event}
+            return (f"{'ok' if ok else 'error'}: {tipo_ev} registrada como {event} (carbs={carbs}, insulina={insulin})", action)
 
         if name == "registrar_insulina":
             u = args.get("unidades")
@@ -1032,7 +1045,8 @@ def _extract_prompt(last_bot: str, user_msg: str) -> str:
         "Respondé SOLO este JSON (sin explicación):\n"
         '{"acciones": [{"tipo": "comida|insulina|ejercicio|glucosa|nota", '
         '"descripcion": "", "carbs_g": null, "insulina_u": null, "unidades": null, '
-        '"clase": "correccion|basal", "duracion_min": null, "valor": null, "texto": ""}]}\n'
+        '"clase": "correccion|basal", "tipo_comida": "comida|colacion|correccion_baja", '
+        '"duracion_min": null, "valor": null, "texto": ""}]}\n'
         "Reglas:\n"
         "- NO inventes datos que no dijo.\n"
         "- Insulina solo si hay UNIDADES explícitas.\n"
@@ -1051,7 +1065,8 @@ def _map_extracted_action(a: dict) -> Optional[tuple]:
     if tipo == "comida":
         return ("registrar_comida", {
             "descripcion": a.get("descripcion") or "comida",
-            "carbs_g": a.get("carbs_g"), "insulina_u": a.get("insulina_u")})
+            "carbs_g": a.get("carbs_g"), "insulina_u": a.get("insulina_u"),
+            "tipo_evento": a.get("tipo_comida") or "comida"})
     if tipo == "insulina":
         u = a.get("unidades") or a.get("insulina_u")
         if not u:
@@ -1613,7 +1628,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if quiere_registrar and carbs is not None:
         food_desc = desc or caption or "Comida (foto)"
-        await post_treatment("Carb Correction", carbs=carbs, notes=f"{food_desc} [estimado por foto]")
+        # Detectar si es colación o comida principal por el caption
+        caption_lower_ev = caption_lower
+        if any(w in caption_lower_ev for w in ("merienda", "snack", "colación", "colacion", "algo")):
+            photo_event = "Snack Bolus"
+        elif any(w in caption_lower_ev for w in ("remontar", "hipo", "baja", "azúcar rápido", "jugo")):
+            photo_event = "Carb Correction"
+        else:
+            photo_event = "Meal Bolus"
+        await post_treatment(photo_event, carbs=carbs, notes=f"{food_desc} [estimado por foto]")
         store.add_history(chat_id, "user", f"[Foto de comida] {caption}")
         store.add_history(chat_id, "assistant", texto)
         await update.message.reply_text(f"📸 {texto}\n\n✅ Registrado en Nightscout.")
