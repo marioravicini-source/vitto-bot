@@ -1033,9 +1033,14 @@ def _extract_prompt(last_bot: str, user_msg: str) -> str:
         '{"acciones": [{"tipo": "comida|insulina|ejercicio|glucosa|nota", '
         '"descripcion": "", "carbs_g": null, "insulina_u": null, "unidades": null, '
         '"clase": "correccion|basal", "duracion_min": null, "valor": null, "texto": ""}]}\n'
-        "Reglas: NO inventes datos que no dijo. Insulina solo si hay UNIDADES. "
-        "Glucosa capilar solo si hay un VALOR numérico. Si no hay nada concreto para "
-        'registrar, devolvé {"acciones": []}.\n\n'
+        "Reglas:\n"
+        "- NO inventes datos que no dijo.\n"
+        "- Insulina solo si hay UNIDADES explícitas.\n"
+        "- Glucosa capilar solo si hay un VALOR numérico.\n"
+        "- Si el usuario PREGUNTA por info nutricional (cuántos carbs tiene, qué "
+        "proteínas tiene, cuántas calorías) pero NO dice que lo comió, NO registres comida.\n"
+        "- Si dice 'no registres', 'no dije que registre', 'no anotar', devolvé acciones vacías.\n"
+        'Si no hay nada concreto para registrar, devolvé {"acciones": []}.\n\n'
         f"[BOT PREGUNTÓ/DIJO]: {last_bot[:300]}\n[VITTORE DIJO]: {user_msg}"
     )
 
@@ -1237,7 +1242,8 @@ FOOD_PROMPT = (
 FOOD_SYSTEM = "Sos un asistente nutricional preciso para diabetes tipo 1. Respondés solo JSON."
 
 
-def _parse_food_json(raw: str) -> tuple[str, Optional[float]]:
+def _parse_food_json(raw: str) -> tuple[str, Optional[float], str]:
+    """Parsea el JSON del modelo de visión. Devuelve (texto, carbs, descripcion)."""
     raw = (raw or "").strip()
     start, end = raw.find("{"), raw.rfind("}")
     data = json.loads(raw[start:end + 1]) if (start >= 0 and end > start) else {}
@@ -1245,17 +1251,22 @@ def _parse_food_json(raw: str) -> tuple[str, Optional[float]]:
     carbs = data.get("carbs_g")
     conf = data.get("confianza", "media")
     comentario = data.get("comentario", "Es una estimación; puede variar según la porción real.")
-    texto = (f"🍽 {desc}\n"
-             f"🍞 Carbs estimados: ~{carbs}g (confianza {conf})\n"
-             f"ℹ️ {comentario}")
-    return texto, (float(carbs) if isinstance(carbs, (int, float)) else None)
+    # Validar carbs: solo mostrar si es un número real
+    carbs_float = None
+    if isinstance(carbs, (int, float)) and carbs > 0:
+        carbs_float = float(carbs)
+        carbs_txt = f"🍞 Carbs estimados: ~{int(carbs)}g (confianza {conf})"
+    else:
+        carbs_txt = "🍞 Carbs: no pude estimar con certeza"
+    texto = f"🍽 {desc}\n{carbs_txt}\nℹ️ {comentario}"
+    return texto, carbs_float, desc
 
 
-async def analyze_food_image(image_bytes: bytes, caption: str = "") -> tuple[str, Optional[float]]:
-    """Estima carbohidratos desde una foto. Enruta al proveedor configurado."""
+async def analyze_food_image(image_bytes: bytes, caption: str = "") -> tuple[str, Optional[float], str]:
+    """Estima carbohidratos desde una foto. Devuelve (texto, carbs, descripcion)."""
     provider = brain_provider()
     if provider == "none":
-        return ("No puedo analizar fotos sin un cerebro configurado (GROQ_API_KEY o ANTHROPIC_API_KEY).", None)
+        return ("No puedo analizar fotos sin un cerebro configurado (GROQ_API_KEY o ANTHROPIC_API_KEY).", None, "")
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     prompt = FOOD_PROMPT + (f"\nComentario del usuario: {caption}" if caption else "")
     try:
@@ -1283,7 +1294,7 @@ async def analyze_food_image(image_bytes: bytes, caption: str = "") -> tuple[str
         return _parse_food_json(raw)
     except Exception as e:
         logger.error(f"analyze_food_image: {type(e).__name__}: {e}")
-        return ("No pude analizar bien la foto. Probá con más luz o incluí un cubierto de referencia.", None)
+        return ("No pude analizar bien la foto. Probá con más luz o incluí un cubierto de referencia.", None, "")
 
 
 # ─── Audio (Whisper de Groq) ─────────────────────────────────────
@@ -1585,13 +1596,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await context.bot.get_file(photo.file_id)
     file_bytes = await file.download_as_bytearray()
     caption = update.message.caption or ""
-    texto, carbs = await analyze_food_image(bytes(file_bytes), caption)
-    # Registrar la comida en Nightscout con los carbs estimados
-    desc = caption or "Comida (foto)"
-    await post_treatment("Carb Correction", carbs=carbs, notes=f"{desc} [estimado por foto]")
-    store.add_history(chat_id, "user", f"[Foto de comida] {caption}")
-    store.add_history(chat_id, "assistant", texto)
-    await update.message.reply_text(f"📸 {texto}\n\n✅ Registrado en Nightscout.")
+
+    # Analizar la foto (estimar carbs, describir comida)
+    texto, carbs, desc = await analyze_food_image(bytes(file_bytes), caption)
+
+    # Detectar si el usuario QUIERE registrar o solo pregunta info nutricional.
+    # Palabras que indican que COMIÓ (registrar): "comí", "almorcé", "cené", "merendé",
+    # "desayuné", "estoy comiendo", "registrá", "anotá".
+    # Si solo pregunta "cuántos carbs tiene" o "qué tiene esto" → NO registrar.
+    caption_lower = caption.lower()
+    quiere_registrar = any(w in caption_lower for w in (
+        "comí", "almorcé", "cené", "merendé", "desayuné", "estoy comiendo",
+        "estoy almorzando", "estoy cenando", "estoy merendando",
+        "registr", "anot", "cargá", "cargalo",
+    ))
+
+    if quiere_registrar and carbs is not None:
+        food_desc = desc or caption or "Comida (foto)"
+        await post_treatment("Carb Correction", carbs=carbs, notes=f"{food_desc} [estimado por foto]")
+        store.add_history(chat_id, "user", f"[Foto de comida] {caption}")
+        store.add_history(chat_id, "assistant", texto)
+        await update.message.reply_text(f"📸 {texto}\n\n✅ Registrado en Nightscout.")
+    else:
+        # Solo informar, NO registrar
+        store.add_history(chat_id, "user", f"[Foto] {caption}")
+        store.add_history(chat_id, "assistant", texto)
+        msg = f"📸 {texto}"
+        if not quiere_registrar and carbs is not None:
+            msg += "\n\n💡 Si querés que lo registre, decime 'anotalo' o 'registralo'."
+        await update.message.reply_text(msg)
 
 
 def _schedule_followups(context: ContextTypes.DEFAULT_TYPE, chat_id: int, actions: list[dict]):
