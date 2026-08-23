@@ -112,6 +112,7 @@ Atlas que ya tenés. Si no hay `MONGODB_URI`, usa RAM como antes.
 | `MONGODB_URI` | recomendada | Para que no pierda la memoria al reiniciar. Usá la misma de tu `.env`. |
 | `ALLOWED_USERS` | sí | Chat IDs autorizados, separados por coma. |
 | `CAREGIVER_CHAT_IDS` | no | A quién van las alertas (por defecto, los de `ALLOWED_USERS`). |
+| `ADMIN_USERS` | recomendada | Quién puede usar `/borrar` para eliminar registros. Poné solo el chat_id de Mario. |
 | `BG_LOW`/`BG_HIGH`/`BG_URGENT_LOW`/`BG_URGENT_HIGH` | no | Umbrales; **confirmalos con el endocrinólogo**. |
 
 > Modo gratis (por defecto): alcanza con **`GROQ_API_KEY`**. Si querés pasar a

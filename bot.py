@@ -88,6 +88,11 @@ ALLOWED_USERS = [u.strip() for u in os.environ.get("ALLOWED_USERS", "").split(",
 CAREGIVER_CHAT_IDS = [
     c.strip() for c in os.environ.get("CAREGIVER_CHAT_IDS", ",".join(ALLOWED_USERS)).split(",") if c.strip()
 ]
+# Quién puede BORRAR registros por Telegram (por defecto, los usuarios permitidos).
+# Conviene setear ADMIN_USERS solo con el chat_id de Mario.
+ADMIN_USERS = [
+    a.strip() for a in os.environ.get("ADMIN_USERS", ",".join(ALLOWED_USERS)).split(",") if a.strip()
+]
 
 # Umbrales de glucosa (mg/dL)
 BG_HIGH = int(os.environ.get("BG_HIGH", "180"))
@@ -345,6 +350,22 @@ async def post_treatment(event_type: str, **kwargs) -> bool:
             return True
     except Exception as e:
         logger.error(f"post_treatment: {type(e).__name__}: {e}")
+    return False
+
+
+async def delete_treatment(treatment_id: str) -> bool:
+    """Borra un tratamiento de Nightscout por su _id."""
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.delete(
+                f"{NIGHTSCOUT_URL}/api/v1/treatments/{treatment_id}",
+                headers=_ns_headers(),
+            )
+            resp.raise_for_status()
+            logger.info(f"Treatment borrado NS: {treatment_id}")
+            return True
+    except Exception as e:
+        logger.error(f"delete_treatment: {type(e).__name__}: {e}")
     return False
 
 
@@ -1173,6 +1194,17 @@ def is_authorized(update: Update) -> bool:
     return str(update.effective_chat.id) in ALLOWED_USERS
 
 
+def is_admin(update: Update) -> bool:
+    if not ADMIN_USERS:
+        return True
+    return str(update.effective_chat.id) in ADMIN_USERS
+
+
+# Estado para el flujo de borrado por Telegram (en memoria, por chat).
+_delete_index: dict[int, list[dict]] = defaultdict(list)  # última lista mostrada
+_delete_pending: dict[int, dict] = {}                     # borrado a confirmar
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("No tenés autorización para usar este bot.")
@@ -1186,6 +1218,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /tratamientos — insulina y carbs (6h)\n"
         "• /registro — lo de hoy\n"
         "• /patrones — patrones de los últimos 14 días\n"
+        "• /borrar — borrar un registro mal cargado (admin)\n"
         "• Escribirme, mandarme audio o una foto de comida 📸\n"
         "• Contarme qué comiste, qué insulina te pusiste o si entrenaste\n\n"
         f"Tu chat ID: {update.effective_chat.id}"
@@ -1241,6 +1274,84 @@ async def cmd_tratamientos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if extra:
         text += "\n\n⚡ " + " · ".join(extra)
     await update.message.reply_text(text)
+
+
+def _short_treatment(t: dict) -> str:
+    try:
+        dt = datetime.fromisoformat(t.get("created_at", "").replace("Z", "+00:00")).astimezone(TZ_AR)
+        ts = dt.strftime("%d/%m %H:%M")
+    except Exception:
+        ts = "?"
+    parts = [t.get("eventType", "?")]
+    if t.get("insulin"):
+        parts.append(f"💉{t['insulin']}U")
+    if t.get("carbs"):
+        parts.append(f"🍞{t['carbs']}g")
+    if t.get("duration"):
+        parts.append(f"⏱{t['duration']}min")
+    notes = t.get("notes")
+    if notes:
+        parts.append(f"— {notes[:35]}")
+    return f"{ts} {' '.join(parts)}"
+
+
+async def cmd_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista tratamientos numerados; /borrar N marca uno para borrar (solo admin)."""
+    if not is_admin(update):
+        await update.message.reply_text("Solo un administrador puede borrar registros.")
+        return
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    # /borrar N  → preparar confirmación
+    if args and args[0].isdigit():
+        n = int(args[0])
+        items = _delete_index.get(chat_id, [])
+        if not (1 <= n <= len(items)):
+            await update.message.reply_text("Número inválido. Mandá /borrar (sin número) para ver la lista.")
+            return
+        t = items[n - 1]
+        _delete_pending[chat_id] = t
+        await update.message.reply_text(
+            f"⚠️ Vas a borrar:\n{_short_treatment(t)}\n\n"
+            "Mandá /confirmar para borrarlo, o /cancelar para dejarlo."
+        )
+        return
+
+    # /borrar  → mostrar lista numerada
+    treatments = await get_treatments(24)
+    if not treatments:
+        await update.message.reply_text("No hay tratamientos recientes para borrar.")
+        return
+    _delete_index[chat_id] = treatments
+    lines = ["🗑 Tratamientos (últimas 24h). Mandá /borrar N para elegir:\n"]
+    for i, t in enumerate(treatments, 1):
+        lines.append(f"{i}. {_short_treatment(t)}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    t = _delete_pending.get(chat_id)
+    if not t:
+        await update.message.reply_text("No hay nada pendiente de borrar. Usá /borrar primero.")
+        return
+    _id = t.get("_id")
+    ok = await delete_treatment(_id) if _id else False
+    _delete_pending.pop(chat_id, None)
+    if ok:
+        await update.message.reply_text(f"✅ Borrado:\n{_short_treatment(t)}")
+    else:
+        await update.message.reply_text("❌ No pude borrarlo. Fijate en los logs o probá de nuevo.")
+
+
+async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    _delete_pending.pop(update.effective_chat.id, None)
+    await update.message.reply_text("Cancelado. No se borró nada.")
 
 
 async def cmd_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1496,6 +1607,9 @@ def main():
     app.add_handler(CommandHandler("tratamientos", cmd_tratamientos))
     app.add_handler(CommandHandler("registro", cmd_registro))
     app.add_handler(CommandHandler("patrones", cmd_patrones))
+    app.add_handler(CommandHandler("borrar", cmd_borrar))
+    app.add_handler(CommandHandler("confirmar", cmd_confirmar))
+    app.add_handler(CommandHandler("cancelar", cmd_cancelar))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
