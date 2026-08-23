@@ -1063,50 +1063,61 @@ async def _ask_anthropic(chat_id: int, user_message: str, ns_context: str) -> tu
 
 
 async def _ask_groq(chat_id: int, user_message: str, ns_context: str) -> tuple[str, list[dict]]:
+    """Chat con Groq. Si el modelo rechaza las herramientas (bug conocido de
+    gpt-oss + tools = 400), reintenta SIN herramientas para que el chat responda
+    igual (el registro automático se pierde en ese caso, pero no se rompe el bot)."""
     history = store.get_history(chat_id, limit=20)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += list(history)
-    messages.append({"role": "user", "content": f"{ns_context}\n\n[MENSAJE DE VITTORE]\n{user_message}"})
-    actions: list[dict] = []
-    final_text = ""
-    tools = _openai_tools()
-    try:
-        for _ in range(4):
-            resp = await asyncio.to_thread(_groq_call, messages, tools)
-            msg = resp.choices[0].message
-            content = extract_answer(msg.content or "")
-            if content:
-                final_text = content
-            tool_calls = getattr(msg, "tool_calls", None)
-            if not tool_calls:
-                break
-            messages.append({
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in tool_calls
-                ],
-            })
-            for tc in tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except Exception:
-                    args = {}
-                result, action = await _run_tool(chat_id, tc.function.name, args)
-                if action:
-                    actions.append(action)
-                messages.append({"role": "tool", "tool_call_id": tc.id,
-                                 "name": tc.function.name, "content": result})
-        if not final_text:
-            final_text = "Listo. ✅" if actions else "No estoy seguro de qué necesitás. ¿Me lo repetís?"
-        store.add_history(chat_id, "user", user_message)
-        store.add_history(chat_id, "assistant", final_text)
-        return final_text, actions
-    except Exception as e:
-        logger.error(f"_ask_groq: {type(e).__name__}: {e}")
-        return (f"Tuve un problema para pensar la respuesta ({type(e).__name__}). Probá de nuevo en un momento.", actions)
+    base = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
+    base.append({"role": "user", "content": f"{ns_context}\n\n[MENSAJE DE VITTORE]\n{user_message}"})
+
+    last_err = None
+    for use_tools in (True, False):
+        messages = [dict(m) for m in base]
+        actions: list[dict] = []
+        final_text = ""
+        try:
+            for _ in range(4):
+                resp = await asyncio.to_thread(
+                    _groq_call, messages, _openai_tools() if use_tools else None)
+                msg = resp.choices[0].message
+                content = extract_answer(msg.content or "")
+                if content:
+                    final_text = content
+                tool_calls = getattr(msg, "tool_calls", None)
+                if not tool_calls:
+                    break
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in tool_calls
+                    ],
+                })
+                for tc in tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except Exception:
+                        args = {}
+                    result, action = await _run_tool(chat_id, tc.function.name, args)
+                    if action:
+                        actions.append(action)
+                    messages.append({"role": "tool", "tool_call_id": tc.id,
+                                     "name": tc.function.name, "content": result})
+            if not final_text:
+                final_text = "Listo. ✅" if actions else "No estoy seguro de qué necesitás. ¿Me lo repetís?"
+            store.add_history(chat_id, "user", user_message)
+            store.add_history(chat_id, "assistant", final_text)
+            return final_text, actions
+        except Exception as e:
+            last_err = e
+            logger.error(f"_ask_groq (tools={use_tools}): {type(e).__name__}: {e}")
+            if use_tools:
+                continue  # reintentar sin herramientas
+    detail = (str(last_err)[:180] if last_err else "").strip()
+    return (f"El modelo de Groq rechazó el pedido ({type(last_err).__name__}). "
+            f"Detalle: {detail}", [])
 
 
 # ─── Visión: foto de comida → carbohidratos ──────────────────────
