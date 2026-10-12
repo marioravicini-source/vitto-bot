@@ -64,6 +64,11 @@ try:
 except Exception:  # pragma: no cover
     MongoClient = None
 
+try:
+    import ml_model as mlm
+except Exception:  # pragma: no cover
+    mlm = None
+
 
 # ─── Configuración ───────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -257,6 +262,22 @@ class Store:
 
 store = Store(MONGODB_URI)
 
+# ─── Modelo ML (Fase 2) ─────────────────────────────────────────
+ml_trained = None  # se carga al arrancar si hay modelo en MongoDB
+ML_CONFIG = {
+    "isf": ISF,
+    "carb_ratio": CARB_RATIO,
+    "insulin_dia_min": INSULIN_DIA_MIN,
+    "insulin_peak_min": INSULIN_PEAK_MIN,
+    "carb_absorb_min": CARB_ABSORB_MIN,
+}
+
+if mlm and store.db is not None:
+    try:
+        ml_trained = mlm.load_model_from_mongo(store.db)
+    except Exception as e:
+        logger.error(f"No pude cargar modelo ML: {e}")
+
 
 # ─── Nightscout: headers y lecturas ──────────────────────────────
 def _ns_headers() -> dict:
@@ -317,6 +338,20 @@ async def get_treatments(hours: int = 6) -> list:
         return await _ns_get("/api/v1/treatments.json", params)
     except Exception as e:
         logger.error(f"get_treatments: {e}")
+    return []
+
+
+async def get_treatments_days(days: int = 30) -> list:
+    """Tratamientos de los últimos N días (para entrenamiento ML)."""
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        params = {
+            "find[created_at][$gte]": since.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "count": days * 50,  # ~50 tratamientos/día max
+        }
+        return await _ns_get("/api/v1/treatments.json", params)
+    except Exception as e:
+        logger.error(f"get_treatments_days: {e}")
     return []
 
 
@@ -733,23 +768,71 @@ def assess_hypo_risk(current: int, slope: Optional[float], boluses: list, carbs:
 
 
 async def compute_prediction() -> Optional[dict]:
-    """Junta datos de Nightscout y devuelve la predicción completa."""
+    """Junta datos de Nightscout y devuelve la predicción completa (physio + ML)."""
+    global ml_trained
     entry = await get_current_bg()
     if not entry:
         return None
     entries, treatments = await asyncio.gather(get_recent_entries(1), get_treatments(6))
     current = entry.get("sgv", 0)
     slope = bg_slope(entries)
-    boluses, carbs, ex = parse_active_treatments(treatments, datetime.now(timezone.utc))
+    now_utc = datetime.now(timezone.utc)
+    boluses, carbs, ex = parse_active_treatments(treatments, now_utc)
     risk = assess_hypo_risk(current, slope, boluses, carbs, ex)
-    return {
+
+    result = {
         "current": current, "slope": slope,
         "p30": risk["p30"], "b30": risk["b30"],
         "p60": risk["p60"], "b60": risk["b60"],
         "risk": risk["level"],
         "iob": compute_iob(boluses), "cob": compute_cob(carbs),
         "exercise_recent": ex,
+        "source": "physio",
     }
+
+    # --- Fase 2: predicción ML ---
+    if mlm and ml_trained is not None:
+        try:
+            # Convertir entries a formato (datetime, sgv) para build_features
+            points = []
+            for e in sorted(entries, key=lambda x: x.get("date", 0)):
+                sgv = e.get("sgv")
+                date_ms = e.get("date")
+                if sgv and date_ms:
+                    ts = datetime.fromtimestamp(date_ms / 1000, tz=timezone.utc)
+                    points.append((ts, int(sgv)))
+
+            if len(points) >= 7:
+                features = mlm.build_features(points, len(points) - 1,
+                                              treatments, ML_CONFIG)
+                if features is not None:
+                    ml_pred = mlm.predict_ml(ml_trained, features)
+                    if ml_pred:
+                        result["ml"] = ml_pred
+                        # Combinar: promediar physio (60%) + ML (40%) si ambos están
+                        if "p30" in ml_pred:
+                            w_physio, w_ml = 0.6, 0.4
+                            result["p30"] = round(result["p30"] * w_physio + ml_pred["p30"] * w_ml)
+                            result["b30"] = ml_pred.get("band_30", result["b30"])
+                            result["source"] = "hybrid"
+                        if "p60" in ml_pred:
+                            result["p60"] = round(result["p60"] * 0.6 + ml_pred["p60"] * 0.4)
+                            result["b60"] = ml_pred.get("band_60", result["b60"])
+                        # Probabilidad de hipo del ML mejora el assess de riesgo
+                        hypo_prob_30 = ml_pred.get("hypo_prob_30", 0)
+                        hypo_prob_60 = ml_pred.get("hypo_prob_60", 0)
+                        if hypo_prob_30 >= 0.5 and result["risk"] == "ninguno":
+                            result["risk"] = "alto"
+                        elif hypo_prob_30 >= 0.3 and result["risk"] == "ninguno":
+                            result["risk"] = "medio"
+                        elif hypo_prob_60 >= 0.4 and result["risk"] == "ninguno":
+                            result["risk"] = "medio"
+                        result["hypo_prob_30"] = hypo_prob_30
+                        result["hypo_prob_60"] = hypo_prob_60
+        except Exception as e:
+            logger.error(f"ML predict error (fallback a physio): {e}")
+
+    return result
 
 
 def format_prediction(pred: dict) -> str:
@@ -758,13 +841,36 @@ def format_prediction(pred: dict) -> str:
     risk_emoji = {"alto": "🔴", "medio": "🟡", "ninguno": "🟢"}.get(pred["risk"], "🟢")
     risk_txt = {"alto": "riesgo ALTO de hipo", "medio": "riesgo medio de hipo",
                 "ninguno": "sin riesgo de hipo a la vista"}.get(pred["risk"])
+
+    source = pred.get("source", "physio")
+    source_label = {"physio": "fisiológico", "hybrid": "ML+fisiológico", "ml": "ML"}.get(source, source)
+
     lines = [
-        f"🔮 Predicción (tendencia {trend})",
-        f"  +30 min: ~{pred['p30']} mg/dL (±{pred['b30']})",
-        f"  +60 min: ~{pred['p60']} mg/dL (±{pred['b60']})",
-        f"{risk_emoji} {risk_txt}",
-        f"💉 IOB {pred['iob']:.1f}U · 🍞 COB {pred['cob']:.0f}g",
+        f"🔮 Predicción ({source_label} · tendencia {trend})",
     ]
+
+    # Bandas: si ML dio rango cuantílico, mostrar p10-p90; si no, ±banda
+    ml = pred.get("ml")
+    if ml and "p30_low" in ml:
+        lines.append(f"  +30 min: ~{pred['p30']} mg/dL ({ml['p30_low']}-{ml['p30_high']})")
+    else:
+        lines.append(f"  +30 min: ~{pred['p30']} mg/dL (±{pred['b30']})")
+
+    if ml and "p60_low" in ml:
+        lines.append(f"  +60 min: ~{pred['p60']} mg/dL ({ml['p60_low']}-{ml['p60_high']})")
+    else:
+        lines.append(f"  +60 min: ~{pred['p60']} mg/dL (±{pred['b60']})")
+
+    # Probabilidad de hipo del ML
+    hypo_30 = pred.get("hypo_prob_30")
+    if hypo_30 is not None and hypo_30 > 0.05:
+        pct = round(hypo_30 * 100)
+        lines.append(f"{risk_emoji} {risk_txt} (prob hipo 30min: {pct}%)")
+    else:
+        lines.append(f"{risk_emoji} {risk_txt}")
+
+    lines.append(f"💉 IOB {pred['iob']:.1f}U · 🍞 COB {pred['cob']:.0f}g")
+
     if pred.get("exercise_recent"):
         lines.append("🏒 Ejercicio reciente: mayor incertidumbre y ojo con las bajas.")
     lines.append("ℹ️ Es una estimación, no un dato exacto.")
@@ -1782,6 +1888,65 @@ def _broadcast(context: ContextTypes.DEFAULT_TYPE, text: str):
             logger.error(f"broadcast a {chat_id}: {e}")
 
 
+# ─── Entrenamiento nocturno ML (Fase 2) ─────────────────────────
+async def nightly_ml_train(context: ContextTypes.DEFAULT_TYPE):
+    """Reentrena el modelo ML con toda la historia disponible. Corre de madrugada."""
+    global ml_trained
+    if not mlm or store.db is None:
+        return
+
+    logger.info("🧠 Iniciando reentrenamiento nocturno ML...")
+    try:
+        # Obtener toda la historia disponible (últimos 90 días)
+        entries = await get_entries_days(90)
+        treatments = await get_treatments_days(90)
+
+        if not entries:
+            logger.warning("No hay entries para entrenar. Abortando.")
+            return
+
+        logger.info(f"Datos obtenidos: {len(entries)} entries, {len(treatments)} treatments")
+
+        # Construir dataset
+        dataset = mlm.build_dataset(entries, treatments, ML_CONFIG)
+        n = dataset.get("n_samples", 0)
+        logger.info(f"Dataset construido: {n} muestras")
+
+        if dataset["X"] is None or n < mlm.MIN_SAMPLES_TRAIN:
+            logger.warning(f"Dataset muy chico ({n} muestras, necesito {mlm.MIN_SAMPLES_TRAIN}). "
+                         "Seguimos con physio solo.")
+            return
+
+        # Entrenar
+        trained = mlm.train_models(dataset)
+        if trained is None:
+            logger.warning("Entrenamiento no produjo modelo. Seguimos con el anterior.")
+            return
+
+        # Guardar en MongoDB
+        saved = mlm.save_model_to_mongo(store.db, trained)
+        if saved:
+            ml_trained = trained  # actualizar en memoria
+            metrics = trained.get("metrics", {})
+            logger.info(f"✓ Modelo ML reentrenado: {n} muestras, "
+                       f"MAE30={metrics.get('mae_30', '?')} MAE60={metrics.get('mae_60', '?')}")
+
+            # Notificar a los cuidadores (breve, no spammear)
+            mae30 = metrics.get("mae_30", "?")
+            mae60 = metrics.get("mae_60", "?")
+            cov30 = metrics.get("coverage_80_30", "?")
+            sens = metrics.get("hypo_sensitivity_30", "?")
+            _broadcast(context,
+                       f"🧠 Modelo ML reentrenado (noche)\n"
+                       f"  {n} datos · error ±{mae30}/{mae60} mg/dL (30/60 min)\n"
+                       f"  Cobertura banda: {cov30}% · Sensibilidad hipo: {sens}%")
+        else:
+            logger.error("No pude guardar el modelo en MongoDB.")
+
+    except Exception as e:
+        logger.error(f"Error en reentrenamiento nocturno: {e}", exc_info=True)
+
+
 # ─── Resumen diario proactivo ────────────────────────────────────
 async def daily_evening_summary(context: ContextTypes.DEFAULT_TYPE):
     """Cada noche: resumen del día + aviso de riesgo nocturno si hubo ejercicio."""
@@ -1819,9 +1984,18 @@ def main():
     app.job_queue.run_repeating(check_alerts, interval=300, first=15)
     # Resumen diario a las 22:30 hora Argentina
     app.job_queue.run_daily(daily_evening_summary, time=dtime(22, 30, tzinfo=TZ_AR))
+    # Reentrenamiento ML a las 04:00 hora Argentina (madrugada, mínimo uso)
+    app.job_queue.run_daily(nightly_ml_train, time=dtime(4, 0, tzinfo=TZ_AR))
+
+    ml_status = "no disponible"
+    if ml_trained:
+        ml_status = f"cargado (v{ml_trained.get('version', '?')}, {ml_trained.get('n_samples', '?')} muestras)"
+    elif mlm:
+        ml_status = "sin modelo aún (se entrena a las 04:00)"
 
     persist = "MongoDB" if store.db is not None else "RAM"
-    logger.info(f"VittoreD1Bot v5 iniciado ✓ | cerebro: {brain_label()} | persistencia: {persist}")
+    logger.info(f"VittoreD1Bot v5 iniciado ✓ | cerebro: {brain_label()} | "
+                f"persistencia: {persist} | ML: {ml_status}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
