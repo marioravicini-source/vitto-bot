@@ -1963,7 +1963,7 @@ async def nightly_ml_train(context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Resumen diario proactivo ────────────────────────────────────
 async def daily_evening_summary(context: ContextTypes.DEFAULT_TYPE):
-    """Cada noche: resumen del día + aviso de riesgo nocturno si hubo ejercicio."""
+    """Cada noche: resumen del día + datos Garmin + aviso de riesgo nocturno."""
     entries = await get_recent_entries(24)
     treatments = await get_treatments(24)
     summary = summarize_entries(entries)
@@ -1972,7 +1972,31 @@ async def daily_evening_summary(context: ContextTypes.DEFAULT_TYPE):
     if ex_today:
         warn = ("\n🌙 Hoy hubo entrenamiento: ojo con las bajas de madrugada. "
                 "Puede convenir medir antes de dormir.")
-    _broadcast(context, f"🌆 Resumen del día:\n{summary}{warn}")
+
+    # Datos Garmin del día
+    garmin_section = ""
+    if garmin and garmin._authenticated:
+        try:
+            daily = garmin.get_daily_summary()
+            parts = []
+            if daily.get("sleep"):
+                parts.append(garmin.format_sleep_note(daily["sleep"]))
+                # Alertar si durmió poco (afecta glucosa)
+                total_min = daily["sleep"].get("total_min", 0)
+                if 0 < total_min < 360:  # menos de 6 horas
+                    parts.append("   ⚠️ Poco sueño: puede haber resistencia a insulina mañana")
+            if daily.get("steps"):
+                parts.append(garmin.format_steps_note(daily["steps"]))
+            vitals = garmin.format_vitals_note(
+                daily.get("heart_rate"), daily.get("stress"), daily.get("body_battery"))
+            if vitals:
+                parts.append(vitals)
+            if parts:
+                garmin_section = "\n\n⌚ *Garmin hoy:*\n" + "\n".join(parts)
+        except Exception as e:
+            logger.error(f"Error datos Garmin para resumen: {e}")
+
+    _broadcast(context, f"🌆 Resumen del día:\n{summary}{warn}{garmin_section}")
 
 
 # ─── Garmin Bridge: polling y comando ─────────────────────────────
@@ -2011,8 +2035,36 @@ async def garmin_poll(context: ContextTypes.DEFAULT_TYPE):
                    f"⌚ Garmin: {synced} actividad(es) sincronizada(s) con Nightscout automáticamente.")
 
 
+async def garmin_daily_collect(context: ContextTypes.DEFAULT_TYPE):
+    """Cada mañana: recolecta datos de sueño, pasos y vitales de ayer y hoy."""
+    if garmin is None or not garmin._authenticated:
+        return
+    try:
+        # Recolectar datos de ayer (sueño completo) y hoy
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        garmin.get_daily_summary(yesterday)
+        today = datetime.now().strftime("%Y-%m-%d")
+        daily = garmin.get_daily_summary(today)
+
+        # Notificar resumen de sueño por la mañana
+        if daily.get("sleep") and daily["sleep"].get("total_min", 0) > 0:
+            sleep_note = garmin.format_sleep_note(daily["sleep"])
+            total_min = daily["sleep"].get("total_min", 0)
+            msg = f"☀️ Buenos días!\n{sleep_note}"
+            if 0 < total_min < 360:
+                msg += "\n⚠️ Pocas horas de sueño — puede haber más resistencia a insulina hoy."
+            elif total_min >= 480:
+                msg += "\n✅ Buen descanso."
+            _broadcast(context, msg)
+
+        logger.info(f"Garmin daily collect OK: sueño={daily.get('sleep') is not None}, "
+                    f"pasos={daily.get('steps') is not None}")
+    except Exception as e:
+        logger.error(f"Error en garmin_daily_collect: {e}")
+
+
 async def cmd_garmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el estado del bridge Garmin."""
+    """Muestra el estado del bridge Garmin + datos de hoy."""
     if not _is_allowed(update):
         return
     if garmin is None:
@@ -2029,9 +2081,27 @@ async def cmd_garmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⌚ *Estado Garmin Bridge*",
         f"  Configurado: {'✅' if status['configured'] else '❌'}",
         f"  Autenticado: {'✅' if status['authenticated'] else '❌'}",
-        f"  Actividades sincronizadas: {status['activities_synced']}",
+        f"  Actividades sync: {status['activities_synced']}",
         f"  Último sync: {status['last_sync']}",
     ]
+
+    # Si está autenticado, mostrar datos de hoy
+    if garmin._authenticated:
+        try:
+            daily = garmin.get_daily_summary()
+            lines.append("")
+            lines.append("📊 *Datos de hoy:*")
+            if daily.get("sleep"):
+                lines.append(f"  {garmin.format_sleep_note(daily['sleep'])}")
+            if daily.get("steps"):
+                lines.append(f"  {garmin.format_steps_note(daily['steps'])}")
+            vitals = garmin.format_vitals_note(
+                daily.get("heart_rate"), daily.get("stress"), daily.get("body_battery"))
+            if vitals:
+                lines.append(f"  {vitals}")
+        except Exception as e:
+            lines.append(f"\n  Error cargando datos: {e}")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -2061,9 +2131,10 @@ def main():
     app.job_queue.run_daily(daily_evening_summary, time=dtime(22, 30, tzinfo=TZ_AR))
     # Reentrenamiento ML a las 04:00 hora Argentina (madrugada, mínimo uso)
     app.job_queue.run_daily(nightly_ml_train, time=dtime(4, 0, tzinfo=TZ_AR))
-    # Garmin Bridge: polling cada 15 minutos
+    # Garmin Bridge: polling cada 15 minutos + recolección diaria a las 08:00
     if garmin and garmin.is_configured():
         app.job_queue.run_repeating(garmin_poll, interval=900, first=30)
+        app.job_queue.run_daily(garmin_daily_collect, time=dtime(8, 0, tzinfo=TZ_AR))
 
     ml_status = "no disponible"
     if ml_trained:
