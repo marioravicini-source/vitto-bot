@@ -69,6 +69,11 @@ try:
 except Exception:  # pragma: no cover
     mlm = None
 
+try:
+    from garmin_bridge import GarminBridge
+except Exception:  # pragma: no cover
+    GarminBridge = None
+
 
 # ─── Configuración ───────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -277,6 +282,15 @@ if mlm and store.db is not None:
         ml_trained = mlm.load_model_from_mongo(store.db)
     except Exception as e:
         logger.error(f"No pude cargar modelo ML: {e}")
+
+# ─── Garmin Bridge (Fase 2.5) ────────────────────────────────────
+garmin = None
+if GarminBridge:
+    garmin = GarminBridge(db=store.db)
+    if garmin.is_configured():
+        logger.info("Garmin Bridge configurado ✓")
+    else:
+        logger.info("Garmin Bridge: sin credenciales (GARMIN_EMAIL/GARMIN_PASSWORD)")
 
 
 # ─── Nightscout: headers y lecturas ──────────────────────────────
@@ -1961,6 +1975,66 @@ async def daily_evening_summary(context: ContextTypes.DEFAULT_TYPE):
     _broadcast(context, f"🌆 Resumen del día:\n{summary}{warn}")
 
 
+# ─── Garmin Bridge: polling y comando ─────────────────────────────
+async def garmin_poll(context: ContextTypes.DEFAULT_TYPE):
+    """Pollea Garmin Connect cada 15 min y registra actividades nuevas en Nightscout."""
+    if garmin is None or not garmin.is_configured():
+        return
+
+    # Autenticar si es necesario
+    if not garmin._authenticated:
+        ok = await garmin.authenticate()
+        if not ok:
+            logger.warning("Garmin poll: no se pudo autenticar")
+            return
+
+    activities = garmin.get_recent_activities(hours=2)
+    synced = 0
+    for act in activities:
+        treatment = garmin.format_for_nightscout(act)
+        if treatment is None:
+            continue
+        # Postear a Nightscout
+        ok = await post_treatment(
+            event_type="Exercise",
+            duration=treatment.get("duration"),
+            notes=treatment.get("notes", ""),
+            created_at=treatment.get("created_at"),
+        )
+        if ok:
+            garmin.mark_activity_synced(act)
+            synced += 1
+            logger.info(f"Garmin → NS: {act.get('activityName')} ({treatment.get('duration')} min)")
+
+    if synced > 0:
+        _broadcast(context,
+                   f"⌚ Garmin: {synced} actividad(es) sincronizada(s) con Nightscout automáticamente.")
+
+
+async def cmd_garmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el estado del bridge Garmin."""
+    if not _is_allowed(update):
+        return
+    if garmin is None:
+        await update.message.reply_text("⌚ Garmin Bridge no disponible (módulo no instalado).")
+        return
+    if not garmin.is_configured():
+        await update.message.reply_text(
+            "⌚ Garmin Bridge no configurado.\n"
+            "Faltan variables: GARMIN_EMAIL y GARMIN_PASSWORD en Railway.")
+        return
+
+    status = garmin.get_status()
+    lines = [
+        "⌚ *Estado Garmin Bridge*",
+        f"  Configurado: {'✅' if status['configured'] else '❌'}",
+        f"  Autenticado: {'✅' if status['authenticated'] else '❌'}",
+        f"  Actividades sincronizadas: {status['activities_synced']}",
+        f"  Último sync: {status['last_sync']}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # ─── Main ────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1975,6 +2049,7 @@ def main():
     app.add_handler(CommandHandler("borrar", cmd_borrar))
     app.add_handler(CommandHandler("confirmar", cmd_confirmar))
     app.add_handler(CommandHandler("cancelar", cmd_cancelar))
+    app.add_handler(CommandHandler("garmin", cmd_garmin))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
@@ -1986,6 +2061,9 @@ def main():
     app.job_queue.run_daily(daily_evening_summary, time=dtime(22, 30, tzinfo=TZ_AR))
     # Reentrenamiento ML a las 04:00 hora Argentina (madrugada, mínimo uso)
     app.job_queue.run_daily(nightly_ml_train, time=dtime(4, 0, tzinfo=TZ_AR))
+    # Garmin Bridge: polling cada 15 minutos
+    if garmin and garmin.is_configured():
+        app.job_queue.run_repeating(garmin_poll, interval=900, first=30)
 
     ml_status = "no disponible"
     if ml_trained:
@@ -1993,9 +2071,15 @@ def main():
     elif mlm:
         ml_status = "sin modelo aún (se entrena a las 04:00)"
 
+    garmin_status = "no disponible"
+    if garmin and garmin.is_configured():
+        garmin_status = "configurado (polling cada 15 min)"
+    elif garmin:
+        garmin_status = "sin credenciales"
+
     persist = "MongoDB" if store.db is not None else "RAM"
     logger.info(f"VittoreD1Bot v5 iniciado ✓ | cerebro: {brain_label()} | "
-                f"persistencia: {persist} | ML: {ml_status}")
+                f"persistencia: {persist} | ML: {ml_status} | Garmin: {garmin_status}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

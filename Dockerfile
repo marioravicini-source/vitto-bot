@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py ml_model.py ./
+COPY bot.py ml_model.py garmin_bridge.py ./
 
 CMD ["python", "bot.py"]
