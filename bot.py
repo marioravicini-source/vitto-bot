@@ -27,6 +27,7 @@ endocrinólogo.
 
 import os
 import io
+import re
 import json
 import math
 import base64
@@ -505,6 +506,8 @@ def format_treatments(treatments: list) -> str:
             parts.append(f"🍞 {t['carbs']}g")
         if t.get("duration"):
             parts.append(f"⏱ {t['duration']}min")
+        if t.get("preBolus"):
+            parts.append(f"⏳ pre-bolo {t['preBolus']}min")
         if t.get("glucose"):
             parts.append(f"🩸 {t['glucose']}")
         if t.get("notes"):
@@ -916,6 +919,7 @@ REGISTRAR:
 Cuando Vittore cuente que comió, se aplicó insulina, hizo ejercicio, midió su glucosa capilar, o quiera dejar una nota, registralo en su seguimiento.
 - Si SOLO dice qué comió pero NO menciona insulina: registrá la comida y PREGUNTALE "¿cuánta Apidra te pusiste?" (en 1 línea, sin sugerir dosis).
 - Si dice qué comió Y cuánta insulina: registrá ambos juntos.
+- PRE-BOLO: si menciona cuántos minutos esperó entre ponerse la insulina y empezar a comer (ej. "esperé 15 min", "me la puse 20 min antes"), registralo en espera_min junto con la comida. NO le digas cuánto tiene que esperar; solo registrá lo que hizo.
 - Si SOLO dice insulina sin comida: registrá la insulina.
 - Si manda una foto y dice que lo comió: registrá y preguntá la insulina.
 - Si manda una foto PREGUNTANDO info nutricional (sin decir que lo comió): NO registres, solo informá.
@@ -923,9 +927,11 @@ Cuando Vittore cuente que comió, se aplicó insulina, hizo ejercicio, midió su
 - Elegí bien el tipo de evento: comida (almuerzo/cena/desayuno), colacion (snack/merienda), o correccion_baja (carbos para remontar una hipo).
 - NUNCA sugieras cuánta insulina ponerse.
 
-FORMATO TELEGRAM:
-- Nada de tablas markdown (Telegram no las renderiza). Usá texto plano y emojis como separadores.
-- Conciso: máximo ~12 líneas. No repitas datos crudos que ya ve en su app.
+FORMATO TELEGRAM (importante):
+- Telegram NO renderiza markdown: si escribís **negrita**, *cursiva*, # títulos o - viñetas, salen los caracteres literales (**, *, #). NO los uses. Escribí en texto plano.
+- Para resaltar usá MAYÚSCULAS cortas o un emoji al inicio de la línea, no asteriscos.
+- Nada de tablas. Usá renglones cortos y emojis como separadores.
+- Conciso de verdad: máximo 6-8 líneas. Respondé solo lo que hace falta; no armes listas largas de recomendaciones ni repitas datos que ya ve en su app.
 - Español argentino, directo, cálido pero sin ser empalagoso ni sermonear. Máx 5 emojis.
 - No arranques con "¡Hola! 👋 Aquí tienes". Andá al grano con calidez.
 - Sin culpa ni reto: celebrá los logros, acompañá los momentos difíciles.
@@ -942,6 +948,7 @@ TOOLS = [
                 "descripcion": {"type": "string", "description": "Qué comió, breve."},
                 "carbs_g": {"type": "number", "description": "Carbohidratos estimados en gramos, si se pueden inferir."},
                 "insulina_u": {"type": "number", "description": "Unidades de insulina que se aplicó junto a la comida, si las mencionó."},
+                "espera_min": {"type": "number", "description": "Pre-bolo: minutos que esperó entre ponerse la insulina y empezar a comer, si lo mencionó (ej. 'esperé 15 min', 'me la puse 20 min antes'). Solo registrar lo que dijo; no sugerir cuánto esperar."},
                 "tipo_evento": {
                     "type": "string",
                     "enum": ["comida", "colacion", "correccion_baja"],
@@ -1018,6 +1025,15 @@ async def _run_tool(chat_id: int, name: str, args: dict) -> tuple[str, Optional[
             insulin = args.get("insulina_u")
             desc = args.get("descripcion", "comida")
             tipo_ev = args.get("tipo_evento", "comida")
+            # Pre-bolo: minutos de espera entre insulina y comida (campo nativo preBolus de NS)
+            espera = args.get("espera_min")
+            try:
+                espera = int(round(float(espera))) if espera is not None else None
+            except (TypeError, ValueError):
+                espera = None
+            notes = desc
+            if espera:
+                notes = f"{desc} · pre-bolo {espera}min"
             # Mapear al eventType correcto de Nightscout
             if tipo_ev == "correccion_baja":
                 event = "Carb Correction"
@@ -1026,9 +1042,9 @@ async def _run_tool(chat_id: int, name: str, args: dict) -> tuple[str, Optional[
             else:
                 # comida principal (almuerzo, cena, desayuno)
                 event = "Meal Bolus"
-            ok = await post_treatment(event, carbs=carbs, insulin=insulin, notes=desc)
-            action = {"tipo": "comida", "desc": desc, "evento_ns": event}
-            return (f"{'ok' if ok else 'error'}: {tipo_ev} registrada como {event} (carbs={carbs}, insulina={insulin})", action)
+            ok = await post_treatment(event, carbs=carbs, insulin=insulin, notes=notes, preBolus=espera)
+            action = {"tipo": "comida", "desc": desc, "evento_ns": event, "espera_min": espera}
+            return (f"{'ok' if ok else 'error'}: {tipo_ev} registrada como {event} (carbs={carbs}, insulina={insulin}, pre-bolo={espera}min)", action)
 
         if name == "registrar_insulina":
             u = args.get("unidades")
@@ -1128,6 +1144,33 @@ def extract_answer(text: str) -> str:
     return text.strip()
 
 
+# Telegram (por defecto, sin parse_mode) NO renderiza markdown: **negrita**, #títulos
+# y - viñetas salen con los caracteres literales. Limpiamos el markdown del texto
+# generado por el modelo antes de enviarlo, para no depender de que "se porte bien".
+_RE_BOLD = re.compile(r"\*\*(.+?)\*\*", re.S)
+_RE_UNDER = re.compile(r"__(.+?)__", re.S)
+_RE_CODE = re.compile(r"`([^`]+)`")
+_RE_HEADER = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
+_RE_BULLET = re.compile(r"^(\s*)[-*]\s+", re.M)
+_RE_ITALIC = re.compile(r"(?<![*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![*\w])")
+_RE_BLANKS = re.compile(r"\n{3,}")
+
+
+def tg_clean(text: str) -> str:
+    """Convierte el markdown del modelo a texto plano apto para Telegram."""
+    if not text:
+        return text
+    t = _RE_BOLD.sub(r"\1", text)      # **negrita** -> negrita
+    t = _RE_UNDER.sub(r"\1", t)         # __x__ -> x
+    t = _RE_CODE.sub(r"\1", t)          # `code` -> code
+    t = _RE_HEADER.sub("", t)           # ## Título -> Título
+    t = _RE_BULLET.sub(r"\1• ", t)      # "- item" / "* item" -> "• item"
+    t = _RE_ITALIC.sub(r"\1", t)        # *cursiva* -> cursiva
+    t = t.replace("**", "")             # cualquier ** suelto
+    t = _RE_BLANKS.sub("\n\n", t)       # máx 1 línea en blanco seguida
+    return t.strip()
+
+
 def _openai_tools() -> list:
     """Convierte TOOLS (formato Anthropic) al formato function-calling de Groq/OpenAI."""
     return [{
@@ -1172,11 +1215,12 @@ def _extract_prompt(last_bot: str, user_msg: str) -> str:
         "preguntó 'cuántas unidades' y Vittore responde un número, es una insulina.\n"
         "Respondé SOLO este JSON (sin explicación):\n"
         '{"acciones": [{"tipo": "comida|insulina|ejercicio|glucosa|nota", '
-        '"descripcion": "", "carbs_g": null, "insulina_u": null, "unidades": null, '
+        '"descripcion": "", "carbs_g": null, "insulina_u": null, "espera_min": null, "unidades": null, '
         '"clase": "correccion|basal", "tipo_comida": "comida|colacion|correccion_baja", '
         '"duracion_min": null, "valor": null, "texto": ""}]}\n'
         "Reglas:\n"
         "- NO inventes datos que no dijo.\n"
+        "- espera_min (pre-bolo) solo si dijo cuántos minutos esperó entre la insulina y la comida (ej. 'esperé 15 min', 'me la puse 20 min antes de comer').\n"
         "- Insulina solo si hay UNIDADES explícitas.\n"
         "- Glucosa capilar solo si hay un VALOR numérico.\n"
         "- Si el usuario PREGUNTA por info nutricional (cuántos carbs tiene, qué "
@@ -1194,6 +1238,7 @@ def _map_extracted_action(a: dict) -> Optional[tuple]:
         return ("registrar_comida", {
             "descripcion": a.get("descripcion") or "comida",
             "carbs_g": a.get("carbs_g"), "insulina_u": a.get("insulina_u"),
+            "espera_min": a.get("espera_min"),
             "tipo_evento": a.get("tipo_comida") or "comida"})
     if tipo == "insulina":
         u = a.get("unidades") or a.get("insulina_u")
@@ -1221,7 +1266,10 @@ def _describe_logged(actions: list[dict]) -> str:
     for a in actions:
         t = a.get("tipo")
         if t == "comida":
-            partes.append(f"🍽 {a.get('desc', 'comida')}")
+            txt = f"🍽 {a.get('desc', 'comida')}"
+            if a.get("espera_min"):
+                txt += f" (pre-bolo {a['espera_min']}min)"
+            partes.append(txt)
         elif t == "insulina":
             partes.append(f"💉 {a.get('u', '?')}U ({a.get('clase', 'correccion')})")
         elif t == "ejercicio":
@@ -1693,7 +1741,7 @@ async def cmd_patrones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      {"role": "user", "content": narr_prompt}],
                     None, None, 500, 0.5)
                 narr = extract_answer(resp.choices[0].message.content or "")
-            await update.message.reply_text(narr or digest)
+            await update.message.reply_text(tg_clean(narr or digest))
             return
         except Exception as e:
             logger.error(f"cmd_patrones narrativa: {e}")
@@ -1707,7 +1755,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
     ns_context = await build_full_context(chat_id)
     response, actions = await ask_llm(chat_id, update.message.text, ns_context)
-    await update.message.reply_text(response)
+    await update.message.reply_text(tg_clean(response))
     _schedule_followups(context, chat_id, actions)
 
 
@@ -1726,7 +1774,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎙 Entendí: _{text}_", parse_mode="Markdown")
     ns_context = await build_full_context(chat_id)
     response, actions = await ask_llm(chat_id, text, ns_context)
-    await update.message.reply_text(response)
+    await update.message.reply_text(tg_clean(response))
     _schedule_followups(context, chat_id, actions)
 
 
@@ -1742,6 +1790,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Analizar la foto (estimar carbs, describir comida)
     texto, carbs, desc = await analyze_food_image(bytes(file_bytes), caption)
+    texto = tg_clean(texto)
 
     # Detectar si el usuario QUIERE registrar o solo pregunta info nutricional.
     # Palabras que indican que COMIÓ (registrar): "comí", "almorcé", "cené", "merendé",
