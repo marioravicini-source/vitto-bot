@@ -41,6 +41,7 @@ except Exception as _imp_err:  # ImportError u otros
 # ---------- config ----------
 GARMIN_PERSONAL_API_KEY = os.environ.get("GARMIN_PERSONAL_API_KEY", "")
 POLL_INTERVAL_MIN = 15
+TZ_AR = timezone(timedelta(hours=-3))  # Argentina (UTC-3): la fecha "de hoy" es la local, no la UTC del servidor
 SYNCED_COLLECTION = "garmin_synced"
 DAILY_DATA_COLLECTION = "garmin_daily"
 
@@ -163,7 +164,7 @@ class GarminBridge:
         if not self._authenticated or not self._access_token:
             return []
         try:
-            end = datetime.now()
+            end = datetime.now(TZ_AR)
             start = end - timedelta(hours=hours)
             with self._client() as client:
                 raw = client.search_activities(
@@ -188,7 +189,7 @@ class GarminBridge:
             return None
         try:
             if date_str is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                date_str = datetime.now(TZ_AR).strftime("%Y-%m-%d")
             with self._client() as client:
                 raw = client.get_daily_sleep(date_str)
             self._log_raw_once("sleep", raw)
@@ -273,7 +274,7 @@ class GarminBridge:
             return None
         try:
             if date_str is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                date_str = datetime.now(TZ_AR).strftime("%Y-%m-%d")
             with self._client() as client:
                 raw = client.get_daily_steps(date_str, date_str)
             self._log_raw_once("steps", raw)
@@ -321,7 +322,7 @@ class GarminBridge:
             return None
         try:
             if date_str is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                date_str = datetime.now(TZ_AR).strftime("%Y-%m-%d")
             with self._client() as client:
                 raw = client.get_daily_heart_rate(date_str)
             self._log_raw_once("hr", raw)
@@ -357,7 +358,7 @@ class GarminBridge:
             return None
         try:
             if date_str is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                date_str = datetime.now(TZ_AR).strftime("%Y-%m-%d")
             with self._client() as client:
                 raw = client.get_daily_stress(date_str, date_str)
             self._log_raw_once("stress", raw)
@@ -397,7 +398,7 @@ class GarminBridge:
             return None
         try:
             if date_str is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
+                date_str = datetime.now(TZ_AR).strftime("%Y-%m-%d")
             with self._client() as client:
                 raw = client.get_daily_body_battery(date_str, date_str)
             self._log_raw_once("body_battery", raw)
@@ -465,7 +466,7 @@ class GarminBridge:
     # ---------- resumen diario ----------
     def get_daily_summary(self, date_str: Optional[str] = None) -> dict:
         if date_str is None:
-            date_str = datetime.now().strftime("%Y-%m-%d")
+            date_str = datetime.now(TZ_AR).strftime("%Y-%m-%d")
 
         summary = {"date": date_str}
         summary["sleep"] = self.get_sleep_data(date_str)
@@ -489,7 +490,7 @@ class GarminBridge:
         if self.db is None:
             return []
         try:
-            start = datetime.now() - timedelta(days=days)
+            start = datetime.now(TZ_AR) - timedelta(days=days)
             docs = list(self.db[DAILY_DATA_COLLECTION].find(
                 {"_id": {"$gte": start.strftime("%Y-%m-%d")}},
                 sort=[("_id", -1)],
