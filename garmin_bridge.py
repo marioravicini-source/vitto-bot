@@ -376,16 +376,18 @@ class GarminBridge:
             if not isinstance(day, dict):
                 return None
 
-            avg = (day.get("avgStressLevel") or day.get("averageStressLevel")
-                   or day.get("overallStressLevel"))
+            # Los valores de estrés pueden venir anidados bajo "values"
+            vals = day.get("values") if isinstance(day.get("values"), dict) else day
+            avg = (vals.get("avgStressLevel") or vals.get("averageStressLevel")
+                   or vals.get("overallStressLevel"))
             return {
                 "date": date_str,
                 "avg_stress": avg if (avg is not None and avg >= 0) else None,
-                "max_stress": day.get("maxStressLevel"),
-                "high_stress_min": round((day.get("highStressDuration") or 0) / 60),
-                "medium_stress_min": round((day.get("mediumStressDuration") or 0) / 60),
-                "low_stress_min": round((day.get("lowStressDuration") or 0) / 60),
-                "rest_stress_min": round((day.get("restStressDuration") or 0) / 60),
+                "max_stress": vals.get("maxStressLevel"),
+                "high_stress_min": round((vals.get("highStressDuration") or 0) / 60),
+                "medium_stress_min": round((vals.get("mediumStressDuration") or 0) / 60),
+                "low_stress_min": round((vals.get("lowStressDuration") or 0) / 60),
+                "rest_stress_min": round((vals.get("restStressDuration") or 0) / 60),
             }
         except Exception as e:
             logger.error("Error obteniendo estrés Garmin: %s", e)
