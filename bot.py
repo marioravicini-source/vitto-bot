@@ -1,4 +1,4 @@
-"""
+se te"""
 VittoreD1Bot v5 — Agente conversacional para diabetes tipo 1
 ============================================================
 Lee datos de Nightscout y acompaña por Telegram usando Claude como cerebro.
@@ -2114,7 +2114,7 @@ async def garmin_daily_collect(context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_garmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra el estado del bridge Garmin + datos de hoy."""
-    if not _is_allowed(update):
+        if not is_authorized(update):
         return
     if garmin is None:
         await update.message.reply_text("⌚ Garmin Bridge no disponible (módulo no instalado).")
